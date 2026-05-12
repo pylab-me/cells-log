@@ -26,7 +26,7 @@ python -m pip install -e .
 From a built wheel:
 
 ```bash
-python -m pip install dist/cells_log-*.whl
+python -m pip install dist/log-*.whl
 ```
 
 ## Quick start
@@ -34,7 +34,8 @@ python -m pip install dist/cells_log-*.whl
 ```python
 from pathlib import Path
 
-from cells_log import LogConfig, configure_logging, get_logger, set_trace_id
+from cells.log import LogConfig, configure_logging, get_logger, set_trace_id
+
 
 configure_logging(
     LogConfig(
@@ -64,7 +65,7 @@ Example JSON line:
 ## Public API
 
 ```python
-from cells_log import (
+from cells.log import (
     LogConfig,
     bootstrap_logging,
     configure_logging,
@@ -83,7 +84,8 @@ from cells_log import (
 Initializes console-only logging from environment variables. This is safe before application settings are loaded.
 
 ```python
-from cells_log import bootstrap_logging, get_logger
+from cells.log import bootstrap_logging, get_logger
+
 
 bootstrap_logging(app_name="demo")
 get_logger("demo.boot").info("bootstrap started")
@@ -94,7 +96,8 @@ get_logger("demo.boot").info("bootstrap started")
 Configures the production handler graph from an explicit `LogConfig`.
 
 ```python
-from cells_log import LogConfig, configure_logging
+from cells.log import LogConfig, configure_logging
+
 
 configure_logging(LogConfig(app_name="demo", level="DEBUG", format="text"))
 ```
@@ -105,7 +108,8 @@ Builds `LogConfig` from environment variables.
 
 ```python
 from pathlib import Path
-from cells_log import configure_logging_from_env
+from cells.log import configure_logging_from_env
+
 
 configure_logging_from_env(
     app_name="demo",
@@ -167,7 +171,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design boundary.
 `trace_id` and log context are stored in `ContextVar`, so they work naturally in async pipelines and request-scoped code.
 
 ```python
-from cells_log import bind_log_context, reset_log_context, set_trace_id, reset_trace_id
+from cells.log import bind_log_context, reset_log_context, set_trace_id, reset_trace_id
+
 
 trace_token = set_trace_id("request-001")
 ctx_token = bind_log_context(request_id="request-001", user_id="u1")
@@ -184,7 +189,7 @@ finally:
 `cells-log` intentionally does not hard-code business policy. Field serialization, redaction, pruning and normalization should be attached through hooks.
 
 ```python
-from cells_log import LogConfig, configure_logging
+from cells.log import LogConfig, configure_logging
 
 
 def field_processor(fields: dict) -> dict:
@@ -201,7 +206,8 @@ Custom JSON serializer:
 
 ```python
 from cells import json
-from cells_log import LogConfig, configure_logging
+from cells.log import LogConfig, configure_logging
+
 
 configure_logging(LogConfig(json_dumps=json.dumps))
 ```
