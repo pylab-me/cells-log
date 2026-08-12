@@ -5,17 +5,41 @@ from __future__ import annotations
 import atexit
 import logging
 import sys
+from contextlib import suppress
 from enum import IntEnum
-from logging.handlers import QueueListener
 from pathlib import Path
 from threading import RLock
 
-from cells.log.config import config_from_env, LogConfig
+from cells.log.config import LogConfig, config_from_env
 from cells.log.context import set_default_trace_id
 from cells.log.formatters import ConsoleTextFormatter, ContextFilter, JsonLineFormatter
-from cells.log.handlers import create_rotating_file_handler, LocalQueueHandler, make_log_queue, ModuleFileRouterHandler
+from cells.log.handlers import (
+    LocalQueueHandler,
+    ModuleFileRouterHandler,
+    SafeQueueListener,
+    create_rotating_file_handler,
+    make_log_queue,
+)
 from cells.log.levels import parse_log_level
 from cells.log.logger import BoundLogger
+
+
+class _LoggerState:
+    """Snapshot of mutable stdlib logger state owned by another component."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+        self.handlers = list(logger.handlers)
+        self.level = logger.level
+        self.propagate = logger.propagate
+        self.disabled = logger.disabled
+
+    def restore(self) -> None:
+        """Restore the logger state captured at construction time."""
+        self.logger.handlers[:] = self.handlers
+        self.logger.setLevel(self.level)
+        self.logger.propagate = self.propagate
+        self.logger.disabled = self.disabled
 
 
 class LogStage(IntEnum):
@@ -36,10 +60,13 @@ class LogManager:
         self._lock = RLock()
         self._handlers: list[logging.Handler] = []
         self._effective_handlers: list[logging.Handler] = []
-        self._queue_listener: QueueListener | None = None
+        self._queue_listener: SafeQueueListener | None = None
         self._queue_handler: LocalQueueHandler | None = None
         self._logger_cache: dict[str, logging.Logger] = {}
         self._config = LogConfig().normalized()
+        self._root_state: _LoggerState | None = None
+        self._warnings_state: _LoggerState | None = None
+        self._warnings_capture_was_enabled = False
         self._level = logging.INFO
         self._stage = LogStage.UNINITIALIZED
         self.bootstrap()
@@ -133,7 +160,26 @@ class LogManager:
             self._handlers.clear()
             self._effective_handlers.clear()
             self._queue_handler = None
+            self._restore_external_loggers()
             self._stage = LogStage.SHUTDOWN
+
+    def get_queue_stats(self) -> dict[str, int | bool]:
+        """Return a snapshot of queue capacity, depth, and dropped records."""
+        with self._lock:
+            if self._queue_handler is None:
+                return {
+                    "enabled": False,
+                    "capacity": 0,
+                    "depth": 0,
+                    "dropped_records": 0,
+                }
+            log_queue = self._queue_handler.queue
+            return {
+                "enabled": True,
+                "capacity": log_queue.maxsize,
+                "depth": log_queue.qsize(),
+                "dropped_records": self._queue_handler.dropped_records,
+            }
 
     def _build_handlers(self, config: LogConfig, *, detail_sink_enabled: bool) -> list[logging.Handler]:
         level = parse_log_level(config.level)
@@ -209,11 +255,16 @@ class LogManager:
         self._handlers = handlers
 
         if use_queue and handlers:
-            log_queue = make_log_queue()
-            queue_handler = LocalQueueHandler(log_queue)
+            log_queue = make_log_queue(config.queue_capacity)
+            queue_handler = LocalQueueHandler(
+                log_queue,
+                full_policy=config.queue_full_policy,
+                block_timeout=config.queue_block_timeout,
+                fallback_handlers=tuple(handlers),
+            )
             queue_handler.setLevel(self._level)
             queue_handler.addFilter(ContextFilter())
-            listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
+            listener = SafeQueueListener(log_queue, *handlers, respect_handler_level=True)
             listener.start()
             self._queue_handler = queue_handler
             self._queue_listener = listener
@@ -223,23 +274,60 @@ class LogManager:
             self._queue_listener = None
             self._effective_handlers = handlers
 
-        logging.captureWarnings(config.capture_warnings)
+        self._configure_external_loggers(config)
         for raw_logger in self._logger_cache.values():
             self._sync_logger(raw_logger)
 
     def _sync_logger(self, raw_logger: logging.Logger) -> None:
         raw_logger.handlers.clear()
         raw_logger.setLevel(self._level)
+        if self._config.manage_root_logger:
+            raw_logger.propagate = True
+            return
         raw_logger.propagate = self._config.propagate
         for handler in self._effective_handlers:
             raw_logger.addHandler(handler)
 
+    def _configure_external_loggers(self, config: LogConfig) -> None:
+        """Optionally route root and warnings records through cells-log."""
+        self._restore_external_loggers()
+
+        if config.manage_root_logger:
+            root_logger = logging.getLogger()
+            self._root_state = _LoggerState(root_logger)
+            root_logger.handlers[:] = self._effective_handlers
+            root_logger.setLevel(self._level)
+            root_logger.disabled = False
+
+        if config.capture_warnings:
+            warnings_logger = logging.getLogger("py.warnings")
+            self._warnings_state = _LoggerState(warnings_logger)
+            self._warnings_capture_was_enabled = getattr(logging, "_warnings_showwarning", None) is not None
+            logging.captureWarnings(True)
+            if config.manage_root_logger:
+                warnings_logger.handlers.clear()
+                warnings_logger.propagate = True
+            else:
+                warnings_logger.handlers[:] = self._effective_handlers
+                warnings_logger.propagate = False
+            warnings_logger.setLevel(self._level)
+            warnings_logger.disabled = False
+
+    def _restore_external_loggers(self) -> None:
+        """Return root and warnings loggers to their pre-cells state."""
+        if self._warnings_state is not None:
+            self._warnings_state.restore()
+            logging.captureWarnings(self._warnings_capture_was_enabled)
+            self._warnings_state = None
+            self._warnings_capture_was_enabled = False
+        if self._root_state is not None:
+            self._root_state.restore()
+            self._root_state = None
+
     def _stop_queue_listener(self) -> None:
         if self._queue_listener is not None:
-            try:
+            with suppress(Exception):
                 self._queue_listener.stop()
-            except Exception:
-                pass
         self._queue_listener = None
         self._queue_handler = None
 
@@ -278,3 +366,8 @@ def get_logger(name: str | None = None) -> BoundLogger:
 
 def shutdown_logging() -> None:
     _MANAGER.shutdown()
+
+
+def get_queue_stats() -> dict[str, int | bool]:
+    """Return queue observability counters for the active configuration."""
+    return _MANAGER.get_queue_stats()

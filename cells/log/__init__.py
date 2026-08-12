@@ -1,6 +1,6 @@
 """cells-log public API."""
 
-from .config import config_from_env, FieldProcessor, JsonDumps, LogConfig
+from .config import FieldProcessor, JsonDumps, LogConfig, config_from_env
 from .context import (
     bind_log_context,
     get_log_context,
@@ -9,14 +9,15 @@ from .context import (
     reset_trace_id,
     set_trace_id,
 )
-from .levels import parse_log_level, TRACE_LEVEL_NUM
+from .levels import TRACE_LEVEL_NUM, parse_log_level
 from .logger import BoundLogger
 from .manager import (
+    LogStage,
     bootstrap_logging,
     configure_logging,
     configure_logging_from_env,
     get_logger,
-    LogStage,
+    get_queue_stats,
     shutdown_logging,
 )
 
@@ -35,6 +36,7 @@ __all__ = [
     "configure_logging_from_env",
     "get_log_context",
     "get_logger",
+    "get_queue_stats",
     "get_trace_id",
     "parse_log_level",
     "reset_log_context",

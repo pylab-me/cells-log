@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from cells.log.config import LogConfig
@@ -49,7 +49,7 @@ class _BaseCellsFormatter(logging.Formatter):
 
     def _timestamp(self, record: logging.LogRecord) -> str:
         if self._config.timestamp_utc:
-            return datetime.fromtimestamp(record.created, timezone.utc).isoformat()
+            return datetime.fromtimestamp(record.created, UTC).isoformat()
         return datetime.fromtimestamp(record.created).isoformat()
 
     def _fields(self, record: logging.LogRecord) -> dict[str, Any]:

@@ -23,7 +23,7 @@ class BoundLogger:
     def raw_logger(self) -> logging.Logger:
         return self._logger
 
-    def bind(self, **fields: Any) -> "BoundLogger":
+    def bind(self, **fields: Any) -> BoundLogger:
         return BoundLogger(self._logger, {**self._context, **fields})
 
     def trace(self, message: str, **fields: Any) -> None:

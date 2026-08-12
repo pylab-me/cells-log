@@ -6,7 +6,8 @@ import copy
 import logging
 import queue
 import re
-from logging.handlers import QueueHandler, RotatingFileHandler, TimedRotatingFileHandler
+from contextlib import suppress
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler, TimedRotatingFileHandler
 from pathlib import Path
 from threading import RLock
 
@@ -25,8 +26,55 @@ class LocalQueueHandler(QueueHandler):
     to preserve exception details for downstream file formatters.
     """
 
+    def __init__(
+        self,
+        log_queue: queue.Queue[logging.LogRecord],
+        *,
+        full_policy: str,
+        block_timeout: float,
+        fallback_handlers: tuple[logging.Handler, ...],
+    ) -> None:
+        super().__init__(log_queue)
+        self._full_policy = full_policy
+        self._block_timeout = block_timeout
+        self._fallback_handlers = fallback_handlers
+        self._dropped_records = 0
+        self._counter_lock = RLock()
+
+    @property
+    def dropped_records(self) -> int:
+        """Return the number of records discarded because the queue was full."""
+        with self._counter_lock:
+            return self._dropped_records
+
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
         return copy.copy(record)
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        """Enqueue a record according to the configured backpressure policy."""
+        try:
+            if self._full_policy == "block":
+                self.queue.put(record, block=True, timeout=self._block_timeout)
+            else:
+                self.queue.put_nowait(record)
+        except queue.Full:
+            if self._full_policy == "sync_fallback":
+                self._write_synchronously(record)
+                return
+            with self._counter_lock:
+                self._dropped_records += 1
+
+    def _write_synchronously(self, record: logging.LogRecord) -> None:
+        for handler in self._fallback_handlers:
+            if record.levelno >= handler.level:
+                handler.handle(record)
+
+
+class SafeQueueListener(QueueListener):
+    """QueueListener that can stop even while a bounded queue is full."""
+
+    def enqueue_sentinel(self) -> None:
+        self.queue.put(self._sentinel, block=True)
 
 
 class ModuleFileRouterHandler(logging.Handler):
@@ -59,10 +107,8 @@ class ModuleFileRouterHandler(logging.Handler):
     def close(self) -> None:
         with self._lock:
             for handler in self._handlers.values():
-                try:
+                with suppress(Exception):
                     handler.close()
-                except Exception:
-                    pass
             self._handlers.clear()
         super().close()
 
@@ -131,5 +177,6 @@ def create_rotating_file_handler(
     return handler
 
 
-def make_log_queue() -> queue.SimpleQueue[logging.LogRecord]:
-    return queue.SimpleQueue()
+def make_log_queue(capacity: int) -> queue.Queue[logging.LogRecord]:
+    """Create a bounded in-process log queue."""
+    return queue.Queue(maxsize=capacity)
