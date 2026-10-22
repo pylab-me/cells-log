@@ -20,7 +20,6 @@ from threading import RLock
 from cells.log.config import LogConfig
 from cells.log.env import parse_size_limit
 
-
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -53,6 +52,11 @@ class LocalQueueHandler(QueueHandler):
     The stdlib QueueHandler.prepare() clears exc_info for pickle-safety. cells-log
     uses an in-process queue by default, so we keep a shallow copy of the record
     to preserve exception details for downstream file formatters.
+
+    Only the record shell is copied; mutable field values are not frozen. Callers
+    should avoid mutating submitted fields after enqueueing. LogConfig.queue_full_policy
+    controls a full queue. sync_fallback writes in the caller and may overtake
+    records waiting in the queue.
     """
 
     def __init__(
@@ -63,7 +67,9 @@ class LocalQueueHandler(QueueHandler):
         block_timeout: float,
         fallback_handlers: tuple[logging.Handler, ...],
     ) -> None:
+        """Bind the bounded queue, full policy and shared sinks without starting a listener."""
         super().__init__(log_queue)
+        # The listener and sync_fallback share sinks rather than opening separate file handlers.
         self._full_policy = full_policy
         self._block_timeout = block_timeout
         self._fallback_handlers = fallback_handlers
@@ -77,6 +83,7 @@ class LocalQueueHandler(QueueHandler):
             return self._dropped_records
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        """Shallow-copy the record, preserving exc_info for the in-process listener."""
         return copy.copy(record)
 
     def enqueue(self, record: logging.LogRecord) -> None:
@@ -103,6 +110,7 @@ class SafeQueueListener(QueueListener):
     """QueueListener that can stop even while a bounded queue is full."""
 
     def enqueue_sentinel(self) -> None:
+        """Wait for capacity to append the stop sentinel even when the queue is full."""
         self.queue.put(self._sentinel, block=True)
 
     def stop(self) -> None:
@@ -120,10 +128,17 @@ class ModuleFileRouterHandler(logging.Handler):
     """Route records to per-module files: a.b.c -> a_b_c.log.
 
     The router is bounded. If too many dynamic logger names are created, records
-    are routed into _overflow.log instead of opening unlimited file descriptors.
+    are routed into overflow.log instead of opening unlimited file descriptors.
+
+    Names outside the configured prefixes use external.log. Special route names
+    are also sanitized, so filenames have no leading underscore. Handlers are
+    cached by actual path: names resolving to the same sanitized path share a
+    file while retaining their original logger names in records. At most one
+    overflow handler is added beyond the cache limit.
     """
 
     def __init__(self, config: LogConfig, formatter: logging.Formatter, level: int) -> None:
+        """Set the module directory and path cache, creating child handlers on first output."""
         super().__init__(level)
         if config.log_dir is None:
             raise ValueError("ModuleFileRouterHandler requires config.log_dir")
@@ -136,6 +151,7 @@ class ModuleFileRouterHandler(logging.Handler):
         self._lock = RLock()
 
     def emit(self, record: logging.LogRecord) -> None:
+        """Route to a module file, delegating formatting and write failures to handleError."""
         try:
             module_name = self._route_name(record.name or self._config.app_name)
             handler = self._get_or_create_handler(module_name)
@@ -144,6 +160,7 @@ class ModuleFileRouterHandler(logging.Handler):
             self.handleError(record)
 
     def close(self) -> None:
+        """Close cached files and clear routes, continuing cleanup if an individual close fails."""
         with self._lock:
             for handler in self._handlers.values():
                 with suppress(Exception):
@@ -200,6 +217,12 @@ def create_rotating_file_handler(
     *,
     delay: bool = False,
 ) -> logging.Handler:
+    """Create a UTF-8 rotating handler with formatter, level and parent directory.
+
+    delay=True defers opening the stream, but not creating its parent directory.
+    Daily rotation uses local midnight; size rotation uses the parsed byte limit.
+    The caller is responsible for closing the handler and its stream.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if config.rotation == "daily":

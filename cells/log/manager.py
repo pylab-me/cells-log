@@ -47,6 +47,12 @@ class _LoggerState:
 
 
 class LogStage(IntEnum):
+    """Represent the active lifecycle stage rather than candidate preparation progress.
+
+    Preparation failure preserves the stage. Bootstrap or production configuration
+    is allowed again after shutdown.
+    """
+
     UNINITIALIZED = 0
     BOOTSTRAP = 1
     PRODUCTION = 2
@@ -55,11 +61,18 @@ class LogStage(IntEnum):
 
 @dataclass(slots=True)
 class _PreparedLoggingGraph:
-    """Own candidate resources until activation or explicit disposal."""
+    """Own candidate resources until activation transfers them or failure releases them.
 
+    This is not another lifecycle stage. During preparation the manager retains
+    the old graph and continues serving records.
+    """
+
+    # Normalized config and parsed level; preparation does not change the global trace fallback.
     config: LogConfig
     level: int
+    # Actual sinks requiring flush/close; never close them while an old listener still uses them.
     handlers: list[logging.Handler] = field(default_factory=list)
+    # Queue entrypoint and consumer; both are None in synchronous mode.
     queue_handler: LocalQueueHandler | None = None
     listener: SafeQueueListener | None = None
 
@@ -78,6 +91,7 @@ class LogManager:
     """
 
     def __init__(self) -> None:
+        """Create a stable entrypoint, bootstrap immediately and register exit cleanup."""
         self._lifecycle_lock = RLock()
         self._lock = RLock()
         self._switching_handler = SwitchingHandler()
@@ -98,6 +112,7 @@ class LogManager:
 
     @property
     def stage(self) -> LogStage:
+        """Return the active stage, unchanged while a candidate is being prepared."""
         return self._stage
 
     def bootstrap(self, *, app_name: str = "app", env_prefix: str = "CELLS_LOG") -> None:
@@ -121,10 +136,21 @@ class LogManager:
             self._replace_handlers(config, stage=LogStage.BOOTSTRAP)
 
     def configure(self, config: LogConfig, *, force: bool = True) -> None:
-        """Configure production logging.
+        """Prepare and activate a config, then retire old resources.
 
-        force=True intentionally replaces the previous handler graph. This makes
-        tests, CLI subcommands and settings reload deterministic.
+        Preparation failure preserves the old config. force=False returns
+        immediately if already in PRODUCTION, without comparing
+        configuration values. Records remain served during candidate preparation
+        and old-resource cleanup. Commit may drain the old queue and switch files;
+        log calls wait for the switch lock, so handover is not zero-latency.
+
+        Args:
+            config: Console, file, queue and integration settings to activate.
+            force: Replace an existing production config when True.
+
+        Raises:
+            ValueError: File logging is enabled without log_dir.
+            OSError: Required directories or candidate file streams cannot open.
         """
         with self._lifecycle_lock:
             if self._stage == LogStage.PRODUCTION and not force:
@@ -148,6 +174,7 @@ class LogManager:
         base: LogConfig | None = None,
         force: bool = True,
     ) -> None:
+        """Activate environment overrides using the precedence in config_from_env()."""
         config = config_from_env(
             app_name=app_name,
             default_log_dir=default_log_dir,
@@ -157,6 +184,7 @@ class LogManager:
         self.configure(config, force=force)
 
     def get_logger(self, name: str | None = None) -> BoundLogger:
+        """Cache the underlying logger and return a new wrapper with channel/log_tag fields."""
         with self._lock:
             logger_name = name or self._config.app_name
             raw_logger = self._logger_cache.get(logger_name)
@@ -174,6 +202,10 @@ class LogManager:
             )
 
     def shutdown(self) -> None:
+        """Detach routes, restore external state and drain resources.
+
+        Retain resources whose cleanup failed for a later retry.
+        """
         with self._lifecycle_lock:
             with self._lock, self._switching_handler.lock:
                 if self._stage == LogStage.SHUTDOWN and not self._retired_graphs:
@@ -191,7 +223,13 @@ class LogManager:
                 self._dispose_graph(graph)
 
     def get_queue_stats(self) -> dict[str, int | bool]:
-        """Return a snapshot of queue capacity, depth, and dropped records."""
+        """Return current queue statistics, reset with each newly configured queue.
+
+        enabled indicates an active queue; capacity counts records. depth is an
+        approximate queue length, excluding records already dequeued but not yet
+        written. dropped_records counts only full-queue discards, not file write
+        failures. Without a queue, enabled is False and all other values are zero.
+        """
         with self._lock:
             if self._queue_handler is None:
                 return {
@@ -379,39 +417,41 @@ class LogManager:
     ) -> None:
         config = self._config if config is None else config
         raw_logger.setLevel(self._level if level is None else level)
-        if config.manage_root_logger:
-            raw_logger.handlers[:] = []
-            raw_logger.propagate = True
-            return
-        raw_logger.propagate = config.propagate
+        # Keep owned loggers on the stable entrypoint even when root ownership
+        # changes; propagating as well would duplicate managed-root records.
+        raw_logger.propagate = False if config.manage_root_logger else config.propagate
         raw_logger.handlers[:] = [self._switching_handler]
 
     def _configure_external_loggers(self, config: LogConfig, level: int) -> None:
         """Optionally route root and warnings records through cells-log."""
-        self._restore_external_loggers()
-
         if config.manage_root_logger:
             root_logger = logging.getLogger()
-            self._root_state = _LoggerState(root_logger)
+            if self._root_state is None:
+                self._root_state = _LoggerState(root_logger)
             root_logger.handlers[:] = [self._switching_handler]
             root_logger.setLevel(level)
             root_logger.disabled = False
+        elif self._root_state is not None:
+            self._root_state.restore()
+            self._root_state = None
 
         if config.capture_warnings:
             warnings_logger = logging.getLogger("py.warnings")
-            self._warnings_state = _LoggerState(warnings_logger)
-            self._warnings_capture_was_enabled = (
-                getattr(logging, "_warnings_showwarning", None) is not None
-            )
+            if self._warnings_state is None:
+                self._warnings_state = _LoggerState(warnings_logger)
+                self._warnings_capture_was_enabled = (
+                    getattr(logging, "_warnings_showwarning", None) is not None
+                )
             logging.captureWarnings(True)
-            if config.manage_root_logger:
-                warnings_logger.handlers.clear()
-                warnings_logger.propagate = True
-            else:
-                warnings_logger.handlers[:] = [self._switching_handler]
-                warnings_logger.propagate = False
+            warnings_logger.handlers[:] = [self._switching_handler]
+            warnings_logger.propagate = False
             warnings_logger.setLevel(level)
             warnings_logger.disabled = False
+        elif self._warnings_state is not None:
+            self._warnings_state.restore()
+            logging.captureWarnings(self._warnings_capture_was_enabled)
+            self._warnings_state = None
+            self._warnings_capture_was_enabled = False
 
     def _restore_external_loggers(self) -> None:
         """Return root and warnings loggers to their pre-cells state."""
@@ -470,10 +510,22 @@ _MANAGER = LogManager()
 
 
 def bootstrap_logging(*, app_name: str = "app", env_prefix: str = "CELLS_LOG") -> None:
+    """Enter console-only bootstrap using environment variables with the given prefix.
+
+    Files and queueing are always disabled; the environment may disable the console
+    too. Calling again also replaces production configuration. Call configure_logging()
+    once the full application configuration is ready.
+    """
     _MANAGER.bootstrap(app_name=app_name, env_prefix=env_prefix)
 
 
 def configure_logging(config: LogConfig, *, force: bool = True) -> None:
+    """Activate production config, retaining existing production config if force=False.
+
+    Preparation failure preserves the old config; activation failure restores old
+    routes. Log calls may wait during handover commit. Configuring does not turn
+    the queue's drop policy into guaranteed delivery.
+    """
     _MANAGER.configure(config, force=force)
 
 
@@ -485,6 +537,12 @@ def configure_logging_from_env(
     base: LogConfig | None = None,
     force: bool = True,
 ) -> None:
+    """Activate config_from_env() overrides with the force semantics of configure_logging.
+
+    base supplies options without environment overrides; default_log_dir provides
+    the base directory fallback. See config_from_env() for environment names,
+    precedence and supported options.
+    """
     _MANAGER.configure_from_env(
         app_name=app_name,
         default_log_dir=default_log_dir,
@@ -495,13 +553,25 @@ def configure_logging_from_env(
 
 
 def get_logger(name: str | None = None) -> BoundLogger:
+    """Return a wrapper with channel/log_tag fields, defaulting the name to app_name.
+
+    Existing wrappers follow configuration changes. Underlying loggers are cached
+    by name, while wrappers are created on every call. Dynamic names grow the cache;
+    put business IDs in fields rather than logger names.
+    """
     return _MANAGER.get_logger(name)
 
 
 def shutdown_logging() -> None:
+    """Stop accepting records, drain the queue, close sinks and restore external state.
+
+    Waiting has no fixed timeout, so slow sinks extend shutdown. Records previously
+    discarded by a full queue are not recovered. Repeat to retry unfinished cleanup;
+    logging may also be configured again afterward.
+    """
     _MANAGER.shutdown()
 
 
 def get_queue_stats() -> dict[str, int | bool]:
-    """Return queue observability counters for the active configuration."""
+    """Return enabled/capacity/depth/dropped_records; see LogManager.get_queue_stats()."""
     return _MANAGER.get_queue_stats()

@@ -667,3 +667,206 @@ def test_candidate_file_open_failure_keeps_old_stream_usable(tmp_path: Path) -> 
     finally:
         manager.shutdown()
     assert [record["message"] for record in _records(tmp_path, "old")] == ["before", "after"]
+
+
+@pytest.mark.parametrize("use_queue", [False, True])
+@pytest.mark.parametrize("activation_fails", [False, True])
+@pytest.mark.parametrize("source", ["root", "owned", "warning"])
+def test_root_and_warnings_keep_stable_routes_during_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_queue: bool,
+    activation_fails: bool,
+    source: str,
+) -> None:
+    """Pause at the former routing gap and verify external and owned records are gated once."""
+    manager = LogManager()
+    manager.configure(
+        _config(
+            tmp_path,
+            "old",
+            use_queue=use_queue,
+            manage_root_logger=True,
+            capture_warnings=True,
+        )
+    )
+    logger = manager.get_logger("transaction.root-handover")
+    root = logging.getLogger()
+    warnings_logger = logging.getLogger("py.warnings")
+    root_state = manager._root_state
+    warnings_state = manager._warnings_state
+    showwarning = warnings.showwarning
+    reached = Event()
+    resume = Event()
+    attempted = Event()
+    produced = Event()
+    failures = []
+
+    def pause():
+        reached.set()
+        assert resume.wait(5), "activation release timed out"
+
+    restore_root = root_state.restore
+
+    def pause_after_root_restore():
+        restore_root()
+        pause()
+
+    configure_external = manager._configure_external_loggers
+
+    def pause_after_external_configuration(config, level):
+        configure_external(config, level)
+        if not reached.is_set():
+            pause()
+
+    publish = manager._publish_graph
+
+    def fail_candidate_publication(graph, stage):
+        publish(graph, stage)
+        if activation_fails and graph.config.app_name == "candidate":
+            raise RuntimeError("candidate publication failed")
+
+    def configure():
+        try:
+            manager.configure(
+                _config(
+                    tmp_path,
+                    "candidate",
+                    use_queue=use_queue,
+                    manage_root_logger=True,
+                    capture_warnings=True,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def signal_attempt(record):
+        attempted.set()
+        return True
+
+    def produce():
+        try:
+            if source == "root":
+                root.warning("root-during-activation")
+            elif source == "owned":
+                logger.info("owned-during-activation")
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("always")
+                    warnings.warn("warning-during-activation", UserWarning)
+            produced.set()
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(root_state, "restore", pause_after_root_restore)
+    monkeypatch.setattr(manager, "_configure_external_loggers", pause_after_external_configuration)
+    monkeypatch.setattr(manager, "_publish_graph", fail_candidate_publication)
+    manager._switching_handler.addFilter(signal_attempt)
+    reloader = Thread(target=configure, daemon=True)
+    producer = Thread(target=produce, daemon=True)
+    try:
+        reloader.start()
+        assert reached.wait(5)
+        assert root.handlers == [manager._switching_handler]
+        assert warnings_logger.handlers == [manager._switching_handler]
+        assert not warnings_logger.propagate
+        assert warnings.showwarning is showwarning
+        assert manager._root_state is root_state
+        assert manager._warnings_state is warnings_state
+        producer.start()
+        assert attempted.wait(5)
+        assert not produced.is_set()
+        resume.set()
+        reloader.join(5)
+        producer.join(5)
+        assert not reloader.is_alive() and not producer.is_alive()
+        assert produced.is_set()
+        if activation_fails:
+            assert len(failures) == 1
+            assert str(failures[0]) == "candidate publication failed"
+        else:
+            assert not failures
+    finally:
+        resume.set()
+        reloader.join(5)
+        if producer.ident is not None:
+            producer.join(5)
+        monkeypatch.setattr(root_state, "restore", restore_root)
+        manager.shutdown()
+
+    active = "old" if activation_fails else "candidate"
+    records = _records(tmp_path, active)
+    assert len(records) == 1
+    if source == "warning":
+        assert "warning-during-activation" in records[0]["message"]
+    else:
+        assert records[0]["message"] == f"{source}-during-activation"
+    assert {record["trace_id"] for record in records} == {active}
+    other = "candidate" if activation_fails else "old"
+    assert _records(tmp_path, other) == []
+
+
+@pytest.mark.parametrize("old_root", [False, True])
+def test_owned_logger_keeps_route_when_root_ownership_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_root: bool
+) -> None:
+    """Keep existing owned loggers on the stable entrypoint when root ownership changes."""
+    manager = LogManager()
+    manager.configure(_config(tmp_path, "old", manage_root_logger=old_root))
+    logger = manager.get_logger("transaction.root-toggle")
+    reached = Event()
+    resume = Event()
+    attempted = Event()
+    produced = Event()
+    failures = []
+    configure_external = manager._configure_external_loggers
+
+    def pause_after_external_configuration(config, level):
+        configure_external(config, level)
+        reached.set()
+        assert resume.wait(5), "root ownership release timed out"
+
+    def signal_attempt(record):
+        attempted.set()
+        return True
+
+    def configure():
+        try:
+            manager.configure(_config(tmp_path, "candidate", manage_root_logger=not old_root))
+        except BaseException as exc:
+            failures.append(exc)
+
+    def produce():
+        try:
+            logger.warning("owned-during-root-toggle")
+            produced.set()
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(manager, "_configure_external_loggers", pause_after_external_configuration)
+    manager._switching_handler.addFilter(signal_attempt)
+    reloader = Thread(target=configure, daemon=True)
+    producer = Thread(target=produce, daemon=True)
+    try:
+        reloader.start()
+        assert reached.wait(5)
+        producer.start()
+        assert attempted.wait(5)
+        assert not produced.is_set()
+        resume.set()
+        reloader.join(5)
+        producer.join(5)
+        assert not reloader.is_alive() and not producer.is_alive()
+        assert produced.is_set()
+        assert not failures
+    finally:
+        resume.set()
+        reloader.join(5)
+        if producer.ident is not None:
+            producer.join(5)
+        manager.shutdown()
+
+    assert _records(tmp_path, "old") == []
+    assert [record["message"] for record in _records(tmp_path, "candidate")] == [
+        "owned-during-root-toggle"
+    ]
