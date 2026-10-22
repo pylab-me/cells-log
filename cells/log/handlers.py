@@ -6,6 +6,7 @@ import copy
 import logging
 import queue
 import re
+from collections.abc import Iterable
 from contextlib import suppress
 from logging.handlers import (
     QueueHandler,
@@ -104,6 +105,16 @@ class SafeQueueListener(QueueListener):
     def enqueue_sentinel(self) -> None:
         self.queue.put(self._sentinel, block=True)
 
+    def stop(self) -> None:
+        """Allow cleanup when thread startup failed before a listener could run."""
+        thread = self._thread
+        if thread is None:
+            return
+        if thread.ident is None:
+            self._thread = None
+            return
+        super().stop()
+
 
 class ModuleFileRouterHandler(logging.Handler):
     """Route records to per-module files: a.b.c -> a_b_c.log.
@@ -139,6 +150,11 @@ class ModuleFileRouterHandler(logging.Handler):
                     handler.close()
             self._handlers.clear()
         super().close()
+
+    def release_file_streams(self) -> None:
+        """Unpin files during handover while preserving routing for rollback."""
+        with self._lock:
+            release_file_streams(self._handlers.values())
 
     def _route_name(self, module_name: str) -> str:
         prefixes = self._config.module_name_prefixes
@@ -181,6 +197,8 @@ def create_rotating_file_handler(
     config: LogConfig,
     formatter: logging.Formatter,
     level: int,
+    *,
+    delay: bool = False,
 ) -> logging.Handler:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -191,6 +209,7 @@ def create_rotating_file_handler(
             interval=1,
             backupCount=config.retention,
             encoding="utf-8",
+            delay=delay,
         )
     else:
         handler = RotatingFileHandler(
@@ -198,11 +217,38 @@ def create_rotating_file_handler(
             maxBytes=parse_size_limit(config.size_limit),
             backupCount=config.retention,
             encoding="utf-8",
+            delay=delay,
         )
 
     handler.setLevel(level)
     handler.setFormatter(formatter)
     return handler
+
+
+def open_file_streams(handlers: Iterable[logging.Handler]) -> None:
+    """Open candidate files only after old rotating writes have drained."""
+    for handler in handlers:
+        if isinstance(handler, logging.FileHandler):
+            with handler.lock:
+                if handler.stream is None:
+                    handler.stream = handler._open()
+                    if isinstance(handler, TimedRotatingFileHandler):
+                        # The old graph may have rotated since candidate construction.
+                        modified = int(Path(handler.baseFilename).stat().st_mtime)
+                        handler.rolloverAt = handler.computeRollover(modified)
+
+
+def release_file_streams(handlers: Iterable[logging.Handler]) -> None:
+    """Unpin retired files before publishing a replacement; allow lazy reopening."""
+    for handler in handlers:
+        if isinstance(handler, ModuleFileRouterHandler):
+            handler.release_file_streams()
+        elif isinstance(handler, logging.FileHandler):
+            with handler.lock:
+                handler.flush()
+                if handler.stream is not None:
+                    handler.stream.close()
+                    handler.stream = None
 
 
 def make_log_queue(capacity: int) -> queue.Queue[logging.LogRecord]:

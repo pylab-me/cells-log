@@ -5,14 +5,14 @@ from __future__ import annotations
 import atexit
 import logging
 import sys
-from contextlib import suppress
-from dataclasses import replace
+import warnings
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from pathlib import Path
 from threading import RLock
 
 from cells.log.config import LogConfig, config_from_env
-from cells.log.context import set_default_trace_id
+from cells.log.context import get_default_trace_id, set_default_trace_id
 from cells.log.formatters import ConsoleTextFormatter, ContextFilter, JsonLineFormatter
 from cells.log.handlers import (
     LocalQueueHandler,
@@ -21,6 +21,8 @@ from cells.log.handlers import (
     SwitchingHandler,
     create_rotating_file_handler,
     make_log_queue,
+    open_file_streams,
+    release_file_streams,
 )
 from cells.log.levels import parse_log_level
 from cells.log.logger import BoundLogger
@@ -51,6 +53,23 @@ class LogStage(IntEnum):
     SHUTDOWN = 3
 
 
+@dataclass(slots=True)
+class _PreparedLoggingGraph:
+    """Own candidate resources until activation or explicit disposal."""
+
+    config: LogConfig
+    level: int
+    handlers: list[logging.Handler] = field(default_factory=list)
+    queue_handler: LocalQueueHandler | None = None
+    listener: SafeQueueListener | None = None
+
+    @property
+    def effective_handlers(self) -> tuple[logging.Handler, ...]:
+        if self.queue_handler is not None:
+            return (self.queue_handler,)
+        return tuple(self.handlers)
+
+
 class LogManager:
     """Bootstrap-safe logging manager.
 
@@ -59,12 +78,14 @@ class LogManager:
     """
 
     def __init__(self) -> None:
+        self._lifecycle_lock = RLock()
         self._lock = RLock()
         self._switching_handler = SwitchingHandler()
         self._handlers: list[logging.Handler] = []
         self._effective_handlers: list[logging.Handler] = []
         self._queue_listener: SafeQueueListener | None = None
         self._queue_handler: LocalQueueHandler | None = None
+        self._retired_graphs: list[_PreparedLoggingGraph] = []
         self._logger_cache: dict[str, logging.Logger] = {}
         self._config = LogConfig().normalized()
         self._root_state: _LoggerState | None = None
@@ -81,7 +102,7 @@ class LogManager:
 
     def bootstrap(self, *, app_name: str = "app", env_prefix: str = "CELLS_LOG") -> None:
         """Configure console-only bootstrap logging from environment."""
-        with self._lock, self._switching_handler.lock:
+        with self._lifecycle_lock:
             base = LogConfig(
                 app_name=app_name,
                 enable_console=True,
@@ -97,11 +118,7 @@ class LogManager:
                 log_dir=None,
                 total_file=None,
             )
-            self._drain_queue()
-            self._replace_handlers(
-                self._build_handlers(config, detail_sink_enabled=False), config, use_queue=False
-            )
-            self._stage = LogStage.BOOTSTRAP
+            self._replace_handlers(config, stage=LogStage.BOOTSTRAP)
 
     def configure(self, config: LogConfig, *, force: bool = True) -> None:
         """Configure production logging.
@@ -109,7 +126,7 @@ class LogManager:
         force=True intentionally replaces the previous handler graph. This makes
         tests, CLI subcommands and settings reload deterministic.
         """
-        with self._lock, self._switching_handler.lock:
+        with self._lifecycle_lock:
             if self._stage == LogStage.PRODUCTION and not force:
                 return
 
@@ -120,13 +137,7 @@ class LogManager:
             if config.log_dir is not None:
                 Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
-            detail_sink_enabled = config.enable_module_file or config.enable_total_file
-            # Producers are paused; drain before opening replacement files so
-            # old and new rotating handlers never write the same path together.
-            self._drain_queue()
-            handlers = self._build_handlers(config, detail_sink_enabled=detail_sink_enabled)
-            self._replace_handlers(handlers, config, use_queue=config.use_queue)
-            self._stage = LogStage.PRODUCTION
+            self._replace_handlers(config, stage=LogStage.PRODUCTION)
 
     def configure_from_env(
         self,
@@ -163,22 +174,21 @@ class LogManager:
             )
 
     def shutdown(self) -> None:
-        with self._lock, self._switching_handler.lock:
-            if self._stage == LogStage.SHUTDOWN:
-                return
-            self._switching_handler.replace_handlers(())
-            self._stop_queue_listener()
-            for handler in self._handlers:
-                try:
-                    handler.flush()
-                    handler.close()
-                except Exception:
-                    pass
-            self._handlers.clear()
-            self._effective_handlers.clear()
-            self._queue_handler = None
-            self._restore_external_loggers()
-            self._stage = LogStage.SHUTDOWN
+        with self._lifecycle_lock:
+            with self._lock, self._switching_handler.lock:
+                if self._stage == LogStage.SHUTDOWN and not self._retired_graphs:
+                    return
+                old_graph = self._current_graph()
+                self._switching_handler.replace_handlers(())
+                self._handlers = []
+                self._effective_handlers = []
+                self._queue_listener = None
+                self._queue_handler = None
+                self._restore_external_loggers()
+                self._stage = LogStage.SHUTDOWN
+                retired, self._retired_graphs = self._retired_graphs, []
+            for graph in [*retired, old_graph]:
+                self._dispose_graph(graph)
 
     def get_queue_stats(self) -> dict[str, int | bool]:
         """Return a snapshot of queue capacity, depth, and dropped records."""
@@ -199,10 +209,14 @@ class LogManager:
             }
 
     def _build_handlers(
-        self, config: LogConfig, *, detail_sink_enabled: bool
-    ) -> list[logging.Handler]:
-        level = parse_log_level(config.level)
-        set_default_trace_id(config.default_trace_id)
+        self,
+        graph: _PreparedLoggingGraph,
+        *,
+        detail_sink_enabled: bool,
+    ) -> None:
+        config = graph.config
+        handlers = graph.handlers
+        level = graph.level
 
         console_formatter: logging.Formatter
         file_formatter: logging.Formatter
@@ -225,30 +239,28 @@ class LogManager:
                 config, include_fields=True, include_exception=True
             )
 
-        handlers: list[logging.Handler] = []
         context_filter = ContextFilter()
 
         if config.enable_console:
             stream = sys.stderr if config.console_to_stderr else sys.stdout
             console_handler = logging.StreamHandler(stream)
+            handlers.append(console_handler)
             console_handler.setLevel(level)
             console_handler.setFormatter(console_formatter)
             console_handler.addFilter(context_filter)
-            handlers.append(console_handler)
 
         if config.enable_module_file:
             module_handler = ModuleFileRouterHandler(config, file_formatter, level)
-            module_handler.addFilter(context_filter)
             handlers.append(module_handler)
+            module_handler.addFilter(context_filter)
 
         if config.enable_total_file:
             total_path = self._resolve_total_file(config)
-            total_handler = create_rotating_file_handler(total_path, config, file_formatter, level)
-            total_handler.addFilter(context_filter)
+            total_handler = create_rotating_file_handler(
+                total_path, config, file_formatter, level, delay=True
+            )
             handlers.append(total_handler)
-
-        self._level = level
-        return handlers
+            total_handler.addFilter(context_filter)
 
     def _resolve_total_file(self, config: LogConfig) -> Path:
         if config.log_dir is None:
@@ -262,65 +274,127 @@ class LogManager:
             return total_file
         return Path(config.log_dir) / total_file
 
-    def _replace_handlers(
-        self, handlers: list[logging.Handler], config: LogConfig, *, use_queue: bool
-    ) -> None:
-        self._stop_queue_listener()
-
-        for old_handler in self._handlers:
-            try:
-                old_handler.flush()
-                old_handler.close()
-            except Exception:
-                pass
-
-        self._config = config
-        self._handlers = handlers
-
-        if use_queue and handlers:
-            log_queue = make_log_queue(config.queue_capacity)
-            queue_handler = LocalQueueHandler(
-                log_queue,
-                full_policy=config.queue_full_policy,
-                block_timeout=config.queue_block_timeout,
-                fallback_handlers=tuple(handlers),
+    def _prepare_graph(self, config: LogConfig) -> _PreparedLoggingGraph:
+        """Build and start an isolated candidate without changing live state."""
+        graph = _PreparedLoggingGraph(config, parse_log_level(config.level))
+        try:
+            self._build_handlers(
+                graph,
+                detail_sink_enabled=config.enable_module_file or config.enable_total_file,
             )
-            queue_handler.setLevel(self._level)
-            queue_handler.addFilter(ContextFilter())
-            listener = SafeQueueListener(log_queue, *handlers, respect_handler_level=True)
-            listener.start()
-            self._queue_handler = queue_handler
-            self._queue_listener = listener
-            self._switching_handler.replace_handlers((queue_handler,))
-        else:
-            self._queue_handler = None
-            self._queue_listener = None
-            self._switching_handler.replace_handlers(tuple(handlers))
+            if config.use_queue and graph.handlers:
+                log_queue = make_log_queue(config.queue_capacity)
+                graph.queue_handler = LocalQueueHandler(
+                    log_queue,
+                    full_policy=config.queue_full_policy,
+                    block_timeout=config.queue_block_timeout,
+                    fallback_handlers=tuple(graph.handlers),
+                )
+                graph.queue_handler.setLevel(graph.level)
+                graph.queue_handler.addFilter(ContextFilter())
+                graph.listener = SafeQueueListener(
+                    log_queue, *graph.handlers, respect_handler_level=True
+                )
+                graph.listener.start()
+            return graph
+        except BaseException:
+            self._dispose_graph(graph)
+            raise
 
-        self._effective_handlers = [self._switching_handler]
+    def _current_graph(self) -> _PreparedLoggingGraph:
+        return _PreparedLoggingGraph(
+            self._config, self._level, self._handlers, self._queue_handler, self._queue_listener
+        )
 
-        self._configure_external_loggers(config)
-        for raw_logger in self._logger_cache.values():
-            self._sync_logger(raw_logger)
+    def _replace_handlers(self, config: LogConfig, *, stage: LogStage) -> None:
+        # Lifecycle calls serialize independently; old logging stays available
+        # throughout candidate construction, listener startup and final cleanup.
+        candidate = self._prepare_graph(config)
+        try:
+            with self._lock, self._switching_handler.lock:
+                previous = self._current_graph()
+                self._drain_queue()
+                try:
+                    open_file_streams(candidate.handlers)
+                    release_file_streams(previous.handlers)
+                    self._activate_graph(candidate, stage)
+                except BaseException:
+                    # Do not let an aborted candidate pin a file once old
+                    # rotating writers resume. Preserve the triggering error.
+                    try:
+                        release_file_streams(candidate.handlers)
+                    except BaseException as exc:
+                        self._report_cleanup_failure("candidate file release", exc)
+                    raise
+        except BaseException:
+            self._dispose_graph(candidate)
+            raise
+        self._dispose_graph(previous)
 
-    def _sync_logger(self, raw_logger: logging.Logger) -> None:
-        raw_logger.setLevel(self._level)
-        if self._config.manage_root_logger:
+    def _publish_graph(self, graph: _PreparedLoggingGraph, stage: LogStage) -> None:
+        """Publish manager state while callers hold both lifecycle locks."""
+        self._config = graph.config
+        self._level = graph.level
+        self._handlers = graph.handlers
+        self._queue_handler = graph.queue_handler
+        self._queue_listener = graph.listener
+        self._effective_handlers = [self._switching_handler] if graph.handlers else []
+        self._stage = stage
+
+    def _activate_graph(self, candidate: _PreparedLoggingGraph, stage: LogStage) -> None:
+        """Apply routing changes or restore the exact preceding logger state."""
+        loggers = {logging.getLogger(), logging.getLogger("py.warnings")}
+        loggers.update(self._logger_cache.values())
+        snapshots = [_LoggerState(logger) for logger in loggers]
+        ownership = self._root_state, self._warnings_state, self._warnings_capture_was_enabled
+        showwarning = warnings.showwarning
+        capture_enabled = getattr(logging, "_warnings_showwarning", None) is not None
+        previous = self._current_graph()
+        previous_stage = self._stage
+        default_trace_id = get_default_trace_id()
+        try:
+            self._configure_external_loggers(candidate.config, candidate.level)
+            for raw_logger in self._logger_cache.values():
+                self._sync_logger(raw_logger, config=candidate.config, level=candidate.level)
+            self._switching_handler.replace_handlers(candidate.effective_handlers)
+            self._publish_graph(candidate, stage)
+            set_default_trace_id(candidate.config.default_trace_id)
+        except BaseException:
+            self._publish_graph(previous, previous_stage)
+            self._switching_handler.replace_handlers(previous.effective_handlers)
+            for snapshot in snapshots:
+                snapshot.restore()
+            logging.captureWarnings(capture_enabled)
+            warnings.showwarning = showwarning
+            self._root_state, self._warnings_state, self._warnings_capture_was_enabled = ownership
+            set_default_trace_id(default_trace_id)
+            raise
+
+    def _sync_logger(
+        self,
+        raw_logger: logging.Logger,
+        *,
+        config: LogConfig | None = None,
+        level: int | None = None,
+    ) -> None:
+        config = self._config if config is None else config
+        raw_logger.setLevel(self._level if level is None else level)
+        if config.manage_root_logger:
             raw_logger.handlers[:] = []
             raw_logger.propagate = True
             return
-        raw_logger.propagate = self._config.propagate
-        raw_logger.handlers[:] = self._effective_handlers
+        raw_logger.propagate = config.propagate
+        raw_logger.handlers[:] = [self._switching_handler]
 
-    def _configure_external_loggers(self, config: LogConfig) -> None:
+    def _configure_external_loggers(self, config: LogConfig, level: int) -> None:
         """Optionally route root and warnings records through cells-log."""
         self._restore_external_loggers()
 
         if config.manage_root_logger:
             root_logger = logging.getLogger()
             self._root_state = _LoggerState(root_logger)
-            root_logger.handlers[:] = self._effective_handlers
-            root_logger.setLevel(self._level)
+            root_logger.handlers[:] = [self._switching_handler]
+            root_logger.setLevel(level)
             root_logger.disabled = False
 
         if config.capture_warnings:
@@ -334,9 +408,9 @@ class LogManager:
                 warnings_logger.handlers.clear()
                 warnings_logger.propagate = True
             else:
-                warnings_logger.handlers[:] = self._effective_handlers
+                warnings_logger.handlers[:] = [self._switching_handler]
                 warnings_logger.propagate = False
-            warnings_logger.setLevel(self._level)
+            warnings_logger.setLevel(level)
             warnings_logger.disabled = False
 
     def _restore_external_loggers(self) -> None:
@@ -355,12 +429,41 @@ class LogManager:
         if self._queue_handler is not None:
             self._queue_handler.queue.join()
 
-    def _stop_queue_listener(self) -> None:
-        if self._queue_listener is not None:
-            with suppress(Exception):
-                self._queue_listener.stop()
-        self._queue_listener = None
-        self._queue_handler = None
+    @staticmethod
+    def _report_cleanup_failure(operation: str, exc: BaseException) -> None:
+        """Report cleanup errors without replacing the original failure."""
+        try:
+            sys.stderr.write(f"cells-log: {operation} failed: {type(exc).__name__}: {exc}\n")
+        except Exception:
+            pass  # Diagnostics cannot undo activation or mask a preparation error.
+
+    def _dispose_graph(self, graph: _PreparedLoggingGraph) -> None:
+        """Release owned resources, retaining failed cleanup for shutdown retry."""
+        if graph.listener is not None:
+            try:
+                graph.listener.stop()
+            except BaseException as exc:
+                self._report_cleanup_failure("listener cleanup", exc)
+                self._retired_graphs.append(graph)
+                return  # A listener must stop before its sinks can close.
+            graph.listener = None
+        if graph.queue_handler is not None:
+            graph.handlers.append(graph.queue_handler)
+            graph.queue_handler = None
+        pending = []
+        for handler in reversed(graph.handlers):
+            try:
+                handler.flush()
+            except BaseException as exc:
+                self._report_cleanup_failure("handler flush", exc)
+            try:
+                handler.close()
+            except BaseException as exc:
+                self._report_cleanup_failure("handler close", exc)
+                pending.append(handler)
+        graph.handlers[:] = reversed(pending)
+        if pending:
+            self._retired_graphs.append(graph)
 
 
 _MANAGER = LogManager()

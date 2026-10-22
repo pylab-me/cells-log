@@ -20,6 +20,11 @@ def set_default_trace_id(default_trace_id: str) -> None:
     _default_trace_id = default_trace_id
 
 
+def get_default_trace_id() -> str:
+    """Return the process fallback independently of the calling context."""
+    return _default_trace_id
+
+
 def get_trace_id() -> str:
     """Return the explicit trace id or the latest configured fallback."""
     return _trace_id_var.get() or _default_trace_id
