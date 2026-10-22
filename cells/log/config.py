@@ -43,91 +43,105 @@ class LogConfig:
     Bootstrap always disables files and the queue. Callers map application
     settings to this object; changing it does not reconfigure active handlers.
     Call configure_logging() again to apply changes.
+
+    Fields merge in context < bind < call order; later values win. Field hooks
+    receive shallow copies and may run repeatedly per record, once per sink,
+    in the listener or caller thread. JSON hooks must return str and handle
+    non-JSON objects. They receive ensure_ascii=False, with one retry without
+    that keyword on TypeError; they also encode text output's field suffixes.
     """
 
-    # Default logger name and prefix of the default aggregate log filename.
+    # Options: <str>. "app" (default) is the fallback logger name and aggregate filename prefix.
     app_name: str = "app"
-    # Accept TRACE, standard level names or integers; unknown names warn and use INFO.
+    # Options: <"TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NOTSET", int>.
+    # "INFO" (default); WARN/FATAL aliases accepted. Unknown names warn and use INFO.
     level: str | int = "INFO"
-    # Select single-line JSON or readable text for both console and files.
+    # Options: <"json", "text">. "json" (default) for single-line JSON;
+    # "text" for human-readable output. Applies to console and files.
     format: LogFormat = "json"
-    # Base directory for file logs, with ~ expansion. Required when either file
-    # output is enabled, even for an absolute total_file; the manager creates it.
+    # Options: <Path, str, None>. None (default); required for any file output, even
+    # with an absolute total_file. Expands ~; the manager creates the directory.
     log_dir: Path | str | None = None
 
-    # Enable console output independently of module and aggregate files.
+    # Options: <True, False>. True (default) enables console output; False disables it.
+    # Independent of module and aggregate file output.
     enable_console: bool = True
-    # True selects stderr, False selects stdout; config diagnostics always use stderr.
+    # Options: <True, False>. True (default) writes to stderr; False writes to stdout.
+    # Configuration diagnostics always use stderr.
     console_to_stderr: bool = True
-    # Include structured fields on the console; files always include them.
+    # Options: <True, False>. False (default) hides console fields; True includes them.
+    # Files always include fields; simplified text errors omit them on the console.
     console_include_fields: bool = False
-    # Include full tracebacks on the console; files always retain available exceptions.
+    # Options: <True, False>. False (default) hides console tracebacks; True includes them.
+    # Files retain available exceptions; simplified text errors omit console tracebacks.
     console_include_exception: bool = False
-    # Text only: with file output enabled, console records at ERROR or above show
-    # a summary and "details in log file", without fields or tracebacks. JSON is unaffected.
+    # Options: <True, False>. True (default) shows only a summary and "details in log file"
+    # for console text errors >= ERROR when files are enabled; False keeps normal detail.
     simplify_console_errors: bool = True
 
-    # Route by logger name, creating each file lazily on its first record.
+    # Options: <True, False>. False (default) disables module files; True routes by logger name.
+    # Each file is created lazily on its first record; bootstrap always disables this option.
     enable_module_file: bool = False
-    # Module file directory, usually a relative subdirectory of log_dir.
+    # Options: <str>. "modules" (default) is the module file subdirectory under log_dir.
+    # An absolute path selects a directory independently of log_dir.
     module_dir_name: str = "modules"
-    # Module handler cache limit, at least 1. New paths beyond the limit use
-    # overflow.log, adding at most one handler without evicting cached handlers.
+    # Options: <int >= 1>. 128 (default) cached module handlers; new paths beyond the limit
+    # use overflow.log, adding at most one handler without evicting existing handlers.
     max_module_handlers: int = 128
-    # Match logger names with str.startswith(tuple); an empty tuple accepts all.
-    # Unmatched names use external.log. Prefixes do not enforce package boundaries.
+    # Options: <tuple[str, ...]>. () (default) accepts all names; otherwise str.startswith
+    # matches prefixes, without package boundaries. Unmatched names use external.log.
     module_name_prefixes: tuple[str, ...] = ()
 
-    # Also write all records to one aggregate file, independently of module files.
+    # Options: <True, False>. False (default) disables the aggregate file; True writes all records.
+    # Independent of module files; bootstrap always disables this option.
     enable_total_file: bool = False
-    # None selects log_dir/<app_name>.log; relative paths use log_dir, absolute paths stand alone.
+    # Options: <Path, str, None>. None (default) selects log_dir/<app_name>.log;
+    # relative paths use log_dir, absolute paths stand alone. Expands ~.
     total_file: Path | str | None = None
 
-    # daily rotates on the first write after local midnight; size uses size_limit.
-    # timestamp_utc controls record timestamps without changing the rotation timezone.
+    # Options: <"daily", "size">. "daily" (default) rotates on the first write after local
+    # midnight; "size" uses size_limit. timestamp_utc does not change the rotation timezone.
     rotation: RotationMode = "daily"
-    # Backup count per file, not a number of days; minimum 0. With 0, daily mode
-    # does not delete old backups, while size mode creates no rotated backups
-    # and the active file may keep growing. Zero does not mean delete all logs.
+    # Options: <int >= 0>. 14 (default) backups per file, not days. With 0, daily keeps all
+    # backups; size creates none and the active file may keep growing. Zero does not delete logs.
     retention: int = 14
-    # Size mode only: integer bytes or B/KB/MB/GB strings using powers of 1024.
-    # For example, 100MB = 104857600 bytes; this is a rotation threshold, not a disk quota.
+    # Options: <int bytes, str bytes/B/KB/MB/GB>. "100MB" (default) = 104857600 bytes.
+    # Size rotation only; units use powers of 1024. A per-file threshold, not a total disk quota.
     size_limit: str | int = "100MB"
 
-    # True writes through an in-process listener thread; False writes in the caller.
-    # The queue is process-local and does not guarantee delivery after a crash.
+    # Options: <True, False>. True (default) uses a process-local listener; False writes in caller.
+    # No crash delivery guarantee; bootstrap always disables the queue.
     use_queue: bool = True
-    # Capacity in records, at least 1; used only with use_queue=True and active sinks.
+    # Options: <int >= 1>. 10_000 (default) queued records, excluding in-flight writes.
+    # Applies only with use_queue=True and active output sinks.
     queue_capacity: int = 10_000
-    # On a full queue, drop discards and counts immediately; block waits up to
-    # queue_block_timeout before discarding and counting. sync_fallback writes in
-    # the caller, potentially increasing latency and overtaking queued records.
+    # Options: <"drop", "block", "sync_fallback">. "drop" (default) discards and counts on full;
+    # "block" waits or drops on timeout; "sync_fallback" writes in caller, risking delay/reordering.
     queue_full_policy: QueueFullPolicy = "drop"
-    # Seconds to wait under block, at least 0; not an I/O, handover or shutdown timeout.
+    # Options: <float >= 0>. 0.1 (default) seconds to wait for space under "block", then drop/count.
+    # Zero does not wait; this is not a file I/O, handover or shutdown timeout.
     queue_block_timeout: float = 0.1
-    # Propagate to parent loggers when root is unmanaged; parent sinks may duplicate output.
-    # manage_root_logger=True disables propagation on owned loggers to prevent duplicates.
+    # Options: <True, False>. False (default) stops propagation; True also uses parent loggers,
+    # potentially duplicating output. manage_root_logger=True forces False on owned loggers.
     propagate: bool = False
-    # Capture Python warnings continuously while enabled; restore prior state
-    # when disabled or shut down.
+    # Options: <True, False>. False (default) leaves warnings unmanaged; True captures them as logs.
+    # Capture stays active across reconfiguration; disabling or shutdown restores prior state.
     capture_warnings: bool = False
-    # Own root to receive third-party records that propagate to it; records stopped
-    # upstream are not captured. Restore prior handlers, level and other state on
-    # disable or shutdown. Root is left unmanaged by default.
+    # Options: <True, False>. False (default) leaves root unmanaged; True captures records at root.
+    # Records stopped upstream are excluded; disabling or shutdown restores prior handlers/state.
     manage_root_logger: bool = False
-    # True emits ISO timestamps with UTC timezone; False uses naive local timestamps.
+    # Options: <True, False>. True (default) emits ISO timestamps with UTC timezone;
+    # False emits local ISO timestamps without a timezone offset.
     timestamp_utc: bool = True
 
-    # Process fallback for contexts without a nonempty trace ID; updated after activation succeeds.
+    # Options: <str>. "system" (default) is the fallback for an empty or unset context trace ID.
+    # Updated only after configuration activation succeeds.
     default_trace_id: str = "system"
-    # Optional processor after merging context < bind < call fields; later values win.
-    # Called separately by each sink's formatter, in the listener or caller thread;
-    # must tolerate repeated calls. Receives a shallow copy. On failure, retain the
-    # original fields and add _field_processor_error.
+    # Options: <None, callable>. None (default) keeps merged fields; callable returns new fields.
+    # On failure, retain original fields and add _field_processor_error. See hook rules above.
     field_processor: FieldProcessor | None = None
-    # JSON encoder, also used for text field suffixes; must return str. Called with
-    # ensure_ascii=False first, then retried once without that keyword on TypeError.
-    # The default uses str() for non-JSON objects; custom encoders must handle them.
+    # Options: <callable>. _default_json_dumps (default) uses ensure_ascii=False and default=str.
+    # Custom encoders must return str; see hook rules above for invocation and retry behavior.
     json_dumps: JsonDumps = _default_json_dumps
 
     def normalized(self) -> LogConfig:
