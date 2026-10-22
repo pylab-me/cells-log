@@ -34,7 +34,7 @@ def env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw.strip())
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # fmt: skip
         return default
 
 

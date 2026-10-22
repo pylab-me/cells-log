@@ -76,7 +76,9 @@ class LogConfig:
         rotation: RotationMode = "daily" if str(self.rotation).lower() == "daily" else "size"
         fmt: LogFormat = "text" if str(self.format).lower() == "text" else "json"
         queue_full_policy: QueueFullPolicy = (
-            self.queue_full_policy if self.queue_full_policy in {"drop", "block", "sync_fallback"} else "drop"
+            self.queue_full_policy
+            if self.queue_full_policy in {"drop", "block", "sync_fallback"}
+            else "drop"
         )
         return replace(
             self,
@@ -111,7 +113,8 @@ def config_from_env(
     cfg = base or LogConfig(app_name=app_name, log_dir=default_log_dir)
 
     log_dir = env_path(
-        env_key(env_prefix, "DIR"), Path(default_log_dir).expanduser() if default_log_dir else cfg.log_dir
+        env_key(env_prefix, "DIR"),
+        Path(default_log_dir).expanduser() if default_log_dir else cfg.log_dir,
     )
     total_file = env_path(env_key(env_prefix, "FILE"), cfg.total_file)
 
@@ -123,7 +126,9 @@ def config_from_env(
         log_dir=log_dir,
         total_file=total_file,
         enable_console=env_bool(env_key(env_prefix, "ENABLE_CONSOLE"), cfg.enable_console),
-        enable_module_file=env_bool(env_key(env_prefix, "ENABLE_MODULE_FILE"), cfg.enable_module_file),
+        enable_module_file=env_bool(
+            env_key(env_prefix, "ENABLE_MODULE_FILE"), cfg.enable_module_file
+        ),
         enable_total_file=env_bool(env_key(env_prefix, "ENABLE_TOTAL_FILE"), cfg.enable_total_file),
         rotation=os.getenv(env_key(env_prefix, "ROTATION"), str(cfg.rotation)).lower(),  # type: ignore[arg-type]
         retention=env_int(env_key(env_prefix, "RETENTION"), cfg.retention),

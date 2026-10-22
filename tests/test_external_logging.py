@@ -10,7 +10,11 @@ from cells.log.manager import LogManager
 
 
 def _messages(path: Path) -> list[str]:
-    return [json.loads(line)["message"] for line in path.read_text(encoding="utf-8").splitlines() if line]
+    return [
+        json.loads(line)["message"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
 
 
 def test_capture_warnings_routes_to_cells_sink_without_root_takeover(

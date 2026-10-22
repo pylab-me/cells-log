@@ -77,7 +77,9 @@ class _BaseCellsFormatter(logging.Formatter):
 class JsonLineFormatter(_BaseCellsFormatter):
     """Production structured JSON line formatter."""
 
-    def __init__(self, config: LogConfig, *, include_fields: bool = True, include_exception: bool = True) -> None:
+    def __init__(
+        self, config: LogConfig, *, include_fields: bool = True, include_exception: bool = True
+    ) -> None:
         super().__init__(config, include_fields=include_fields, include_exception=include_exception)
 
     def format(self, record: logging.LogRecord) -> str:
@@ -131,7 +133,11 @@ class ConsoleTextFormatter(_BaseCellsFormatter):
         reset = _COLORS["RESET"] if use_color else ""
         level_fmt = f"{color}[{level_char}]{reset}"
 
-        if self._simplify_console_errors and self._detail_sink_enabled and record.levelno >= logging.ERROR:
+        if (
+            self._simplify_console_errors
+            and self._detail_sink_enabled
+            and record.levelno >= logging.ERROR
+        ):
             return f"{level_fmt} [{timestamp}] [{trace_id}] {record.name}: {record.getMessage()} (details in log file)"
 
         suffix = ""
@@ -142,7 +148,9 @@ class ConsoleTextFormatter(_BaseCellsFormatter):
             except TypeError:
                 suffix = f" | {self._config.json_dumps(fields)}"
 
-        message = f"{level_fmt} [{timestamp}] [{trace_id}] {record.name}: {record.getMessage()}{suffix}"
+        message = (
+            f"{level_fmt} [{timestamp}] [{trace_id}] {record.name}: {record.getMessage()}{suffix}"
+        )
         exception = self._exception_text(record)
         if exception:
             message += "\n" + exception

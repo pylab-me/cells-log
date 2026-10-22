@@ -37,7 +37,9 @@ def read_version(version_file: Path) -> str:
 setup(
     name="cells-log",
     version=read_version(VERSION_FILE),
-    description=("Structured, bootstrap-safe logging kernel for Python services and CLI applications."),
+    description=(
+        "Structured, bootstrap-safe logging kernel for Python services and CLI applications."
+    ),
     long_description=README_FILE.read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     url="https://github.com/pylab-me/cells-log",
@@ -47,7 +49,7 @@ setup(
         "Source": "https://github.com/pylab-me/cells-log",
     },
     license="MPL-2.0",
-    author="HarmonSir",
+    author="PYLAB",
     author_email="git@pylab.me",
     packages=find_namespace_packages(include=["cells.*"]),
     include_package_data=True,
@@ -57,7 +59,6 @@ setup(
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",

@@ -6,6 +6,7 @@ import atexit
 import logging
 import sys
 from contextlib import suppress
+from dataclasses import replace
 from enum import IntEnum
 from pathlib import Path
 from threading import RLock
@@ -17,6 +18,7 @@ from cells.log.handlers import (
     LocalQueueHandler,
     ModuleFileRouterHandler,
     SafeQueueListener,
+    SwitchingHandler,
     create_rotating_file_handler,
     make_log_queue,
 )
@@ -58,6 +60,7 @@ class LogManager:
 
     def __init__(self) -> None:
         self._lock = RLock()
+        self._switching_handler = SwitchingHandler()
         self._handlers: list[logging.Handler] = []
         self._effective_handlers: list[logging.Handler] = []
         self._queue_listener: SafeQueueListener | None = None
@@ -78,7 +81,7 @@ class LogManager:
 
     def bootstrap(self, *, app_name: str = "app", env_prefix: str = "CELLS_LOG") -> None:
         """Configure console-only bootstrap logging from environment."""
-        with self._lock:
+        with self._lock, self._switching_handler.lock:
             base = LogConfig(
                 app_name=app_name,
                 enable_console=True,
@@ -86,8 +89,18 @@ class LogManager:
                 enable_total_file=False,
                 use_queue=False,
             )
-            config = config_from_env(app_name=app_name, env_prefix=env_prefix, base=base).normalized()
-            self._replace_handlers(self._build_handlers(config, detail_sink_enabled=False), config, use_queue=False)
+            config = replace(
+                config_from_env(app_name=app_name, env_prefix=env_prefix, base=base),
+                enable_module_file=False,
+                enable_total_file=False,
+                use_queue=False,
+                log_dir=None,
+                total_file=None,
+            )
+            self._drain_queue()
+            self._replace_handlers(
+                self._build_handlers(config, detail_sink_enabled=False), config, use_queue=False
+            )
             self._stage = LogStage.BOOTSTRAP
 
     def configure(self, config: LogConfig, *, force: bool = True) -> None:
@@ -96,7 +109,7 @@ class LogManager:
         force=True intentionally replaces the previous handler graph. This makes
         tests, CLI subcommands and settings reload deterministic.
         """
-        with self._lock:
+        with self._lock, self._switching_handler.lock:
             if self._stage == LogStage.PRODUCTION and not force:
                 return
 
@@ -108,6 +121,9 @@ class LogManager:
                 Path(config.log_dir).mkdir(parents=True, exist_ok=True)
 
             detail_sink_enabled = config.enable_module_file or config.enable_total_file
+            # Producers are paused; drain before opening replacement files so
+            # old and new rotating handlers never write the same path together.
+            self._drain_queue()
             handlers = self._build_handlers(config, detail_sink_enabled=detail_sink_enabled)
             self._replace_handlers(handlers, config, use_queue=config.use_queue)
             self._stage = LogStage.PRODUCTION
@@ -147,9 +163,10 @@ class LogManager:
             )
 
     def shutdown(self) -> None:
-        with self._lock:
+        with self._lock, self._switching_handler.lock:
             if self._stage == LogStage.SHUTDOWN:
                 return
+            self._switching_handler.replace_handlers(())
             self._stop_queue_listener()
             for handler in self._handlers:
                 try:
@@ -181,7 +198,9 @@ class LogManager:
                 "dropped_records": self._queue_handler.dropped_records,
             }
 
-    def _build_handlers(self, config: LogConfig, *, detail_sink_enabled: bool) -> list[logging.Handler]:
+    def _build_handlers(
+        self, config: LogConfig, *, detail_sink_enabled: bool
+    ) -> list[logging.Handler]:
         level = parse_log_level(config.level)
         set_default_trace_id(config.default_trace_id)
 
@@ -202,7 +221,9 @@ class LogManager:
                 simplify_console_errors=config.simplify_console_errors,
                 detail_sink_enabled=detail_sink_enabled,
             )
-            file_formatter = ConsoleTextFormatter(config, include_fields=True, include_exception=True)
+            file_formatter = ConsoleTextFormatter(
+                config, include_fields=True, include_exception=True
+            )
 
         handlers: list[logging.Handler] = []
         context_filter = ContextFilter()
@@ -241,7 +262,9 @@ class LogManager:
             return total_file
         return Path(config.log_dir) / total_file
 
-    def _replace_handlers(self, handlers: list[logging.Handler], config: LogConfig, *, use_queue: bool) -> None:
+    def _replace_handlers(
+        self, handlers: list[logging.Handler], config: LogConfig, *, use_queue: bool
+    ) -> None:
         self._stop_queue_listener()
 
         for old_handler in self._handlers:
@@ -268,25 +291,26 @@ class LogManager:
             listener.start()
             self._queue_handler = queue_handler
             self._queue_listener = listener
-            self._effective_handlers = [queue_handler]
+            self._switching_handler.replace_handlers((queue_handler,))
         else:
             self._queue_handler = None
             self._queue_listener = None
-            self._effective_handlers = handlers
+            self._switching_handler.replace_handlers(tuple(handlers))
+
+        self._effective_handlers = [self._switching_handler]
 
         self._configure_external_loggers(config)
         for raw_logger in self._logger_cache.values():
             self._sync_logger(raw_logger)
 
     def _sync_logger(self, raw_logger: logging.Logger) -> None:
-        raw_logger.handlers.clear()
         raw_logger.setLevel(self._level)
         if self._config.manage_root_logger:
+            raw_logger.handlers[:] = []
             raw_logger.propagate = True
             return
         raw_logger.propagate = self._config.propagate
-        for handler in self._effective_handlers:
-            raw_logger.addHandler(handler)
+        raw_logger.handlers[:] = self._effective_handlers
 
     def _configure_external_loggers(self, config: LogConfig) -> None:
         """Optionally route root and warnings records through cells-log."""
@@ -302,7 +326,9 @@ class LogManager:
         if config.capture_warnings:
             warnings_logger = logging.getLogger("py.warnings")
             self._warnings_state = _LoggerState(warnings_logger)
-            self._warnings_capture_was_enabled = getattr(logging, "_warnings_showwarning", None) is not None
+            self._warnings_capture_was_enabled = (
+                getattr(logging, "_warnings_showwarning", None) is not None
+            )
             logging.captureWarnings(True)
             if config.manage_root_logger:
                 warnings_logger.handlers.clear()
@@ -323,6 +349,11 @@ class LogManager:
         if self._root_state is not None:
             self._root_state.restore()
             self._root_state = None
+
+    def _drain_queue(self) -> None:
+        """Wait for accepted records while the switching handler pauses producers."""
+        if self._queue_handler is not None:
+            self._queue_handler.queue.join()
 
     def _stop_queue_listener(self) -> None:
         if self._queue_listener is not None:

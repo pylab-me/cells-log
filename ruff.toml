@@ -1,0 +1,17 @@
+# 全局基础配置
+line-length = 100
+target-version = "py314"
+
+[lint]
+# 启用基础检查、导入排序以及 Google 风格的文档字符串检查
+select = [
+    "E", # pycodestyle errors
+    "W", # pycodestyle warnings
+    "F", # Pyflakes
+    "I", # isort (导入排序)
+    "D", # pydocstyle (文档字符串检查)
+]
+
+[lint.pydocstyle]
+# 核心：将文档字符串规范设置为 Google 风格
+convention = "google"

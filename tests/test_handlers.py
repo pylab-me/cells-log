@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from pathlib import Path
+
+import pytest
 
 from cells.log.config import LogConfig
 from cells.log.formatters import JsonLineFormatter
@@ -71,3 +75,45 @@ def test_size_rotation_creates_backup(tmp_path: Path) -> None:
 
 def test_module_file_name_is_sanitized() -> None:
     assert _sanitize_module_file_name("../../ unsafe name") == "unsafe_name"
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("audit.collision", "audit_collision"),
+        ("audit.collision", "audit/collision"),
+        pytest.param(
+            ("audit.collision", "AUDIT.COLLISION"),
+            marks=pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive paths"),
+        ),
+    ],
+)
+def test_module_filename_aliases_share_safe_rotation(
+    tmp_path: Path,
+    names: tuple[str, str],
+) -> None:
+    """Preserve all aliased module records across rotation and the handler cap."""
+    config = LogConfig(
+        log_dir=tmp_path,
+        rotation="size",
+        size_limit=1,
+        retention=10,
+        max_module_handlers=1,
+    ).normalized()
+    router = ModuleFileRouterHandler(config, JsonLineFormatter(config), logging.INFO)
+    expected = []
+    try:
+        for index, name in enumerate(names * 2):
+            message = f"record-{index}"
+            router.handle(_record(name, message))
+            expected.append((name, message))
+    finally:
+        router.close()
+
+    records = [
+        json.loads(line)
+        for path in (tmp_path / "modules").glob("*")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sorted((record["logger"], record["message"]) for record in records) == sorted(expected)
+    assert not (tmp_path / "modules" / "overflow.log").exists()

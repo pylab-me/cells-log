@@ -7,7 +7,12 @@ import logging
 import queue
 import re
 from contextlib import suppress
-from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler, TimedRotatingFileHandler
+from logging.handlers import (
+    QueueHandler,
+    QueueListener,
+    RotatingFileHandler,
+    TimedRotatingFileHandler,
+)
 from pathlib import Path
 from threading import RLock
 
@@ -16,6 +21,29 @@ from cells.log.env import parse_size_limit
 
 
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class SwitchingHandler(logging.Handler):
+    """Keep a stable logging entrypoint while the managed sinks change."""
+
+    def __init__(self) -> None:
+        """Initialize an empty handler group."""
+        super().__init__()
+        self._handlers: tuple[logging.Handler, ...] = ()
+
+    def replace_handlers(self, handlers: tuple[logging.Handler, ...]) -> None:
+        """Replace sinks under the same lock used for record delivery."""
+        self.acquire()
+        try:
+            self._handlers = handlers
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Deliver a record to the current sinks while handle() holds the lock."""
+        for handler in self._handlers:
+            if record.levelno >= handler.level:
+                handler.handle(record)
 
 
 class LocalQueueHandler(QueueHandler):
@@ -90,10 +118,10 @@ class ModuleFileRouterHandler(logging.Handler):
             raise ValueError("ModuleFileRouterHandler requires config.log_dir")
 
         self._config = config
-        self._base_dir = Path(config.log_dir)
+        self._module_dir = (Path(config.log_dir) / config.module_dir_name).resolve()
         self._formatter = formatter
         self._level = level
-        self._handlers: dict[str, logging.Handler] = {}
+        self._handlers: dict[Path, logging.Handler] = {}
         self._lock = RLock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -120,26 +148,26 @@ class ModuleFileRouterHandler(logging.Handler):
 
     def _get_or_create_handler(self, module_name: str) -> logging.Handler:
         with self._lock:
-            handler = self._handlers.get(module_name)
+            log_path = self._module_path(module_name)
+            handler = self._handlers.get(log_path)
             if handler is not None:
                 return handler
 
             if len(self._handlers) >= self._config.max_module_handlers:
-                module_name = "_overflow"
-                handler = self._handlers.get(module_name)
+                log_path = self._module_path("_overflow")
+                handler = self._handlers.get(log_path)
                 if handler is not None:
                     return handler
 
-            handler = self._create_handler(module_name)
-            self._handlers[module_name] = handler
+            handler = create_rotating_file_handler(
+                log_path, self._config, self._formatter, self._level
+            )
+            self._handlers[log_path] = handler
             return handler
 
-    def _create_handler(self, module_name: str) -> logging.Handler:
+    def _module_path(self, module_name: str) -> Path:
         file_name = _sanitize_module_file_name(module_name)
-        log_path = self._base_dir / self._config.module_dir_name / f"{file_name}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handler = create_rotating_file_handler(log_path, self._config, self._formatter, self._level)
-        return handler
+        return self._module_dir / f"{file_name}.log"
 
 
 def _sanitize_module_file_name(module_name: str) -> str:
