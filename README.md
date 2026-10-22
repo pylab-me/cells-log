@@ -4,7 +4,7 @@
 
 It keeps Python's stdlib `logging` ecosystem underneath, but exposes a small bound-logger API with bootstrap-safe initialization, structured fields, `ContextVar`-based trace context, file routing and optional queue-based writing.
 
-The import package name is `cells_log`.
+The import package path is `cells.log`.
 
 ## Why this package exists
 
@@ -26,7 +26,7 @@ python -m pip install -e .
 From a built wheel:
 
 ```bash
-python -m pip install dist/log-*.whl
+python -m pip install dist/cells_log-*.whl
 ```
 
 ## Quick start
@@ -34,32 +34,43 @@ python -m pip install dist/log-*.whl
 ```python
 from pathlib import Path
 
-from cells.log import LogConfig, configure_logging, get_logger, set_trace_id
+from cells.log import (
+    LogConfig,
+    configure_logging,
+    get_logger,
+    reset_trace_id,
+    set_trace_id,
+    shutdown_logging,
+)
 
 
 configure_logging(
     LogConfig(
-        app_name="pokaemon",
+        app_name="app",
         level="INFO",
         format="json",
         log_dir=Path("./logs"),
         enable_console=True,
         enable_module_file=True,
         enable_total_file=True,
-        total_file="pokaemon.log",
-        module_name_prefixes=("pokaemon",),
+        total_file="app.log",
+        module_name_prefixes=("app",),
     )
 )
 
-set_trace_id("trace-001")
-log = get_logger("pokaemon.collector").bind(stage="collector")
-log.info("task completed", task_id="t1", duration_ms=12.3)
+trace_token = set_trace_id("trace-001")
+try:
+    log = get_logger("app.worker").bind(stage="worker")
+    log.info("task completed", task_id="t1", duration_ms=12.3)
+finally:
+    reset_trace_id(trace_token)
+    shutdown_logging()
 ```
 
 Example JSON line:
 
 ```json
-{"timestamp":"2026-05-11T00:00:00+00:00","level":"INFO","logger":"pokaemon.collector","message":"task completed","trace_id":"trace-001","path":"/app/collector.py:42","func":"run","fields":{"channel":"pokaemon.collector","log_tag":"pokaemon_collector","stage":"collector","task_id":"t1","duration_ms":12.3}}
+{"timestamp":"2026-05-11T00:00:00+00:00","level":"INFO","logger":"app.worker","message":"task completed","trace_id":"trace-001","path":"/app/worker.py:42","func":"run","fields":{"channel":"app.worker","log_tag":"app_worker","stage":"worker","task_id":"t1","duration_ms":12.3}}
 ```
 
 ## Public API
@@ -71,6 +82,7 @@ from cells.log import (
     configure_logging,
     configure_logging_from_env,
     get_logger,
+    get_queue_stats,
     set_trace_id,
     reset_trace_id,
     bind_log_context,
@@ -81,7 +93,7 @@ from cells.log import (
 
 ### `bootstrap_logging()`
 
-Initializes console-only logging from environment variables. This is safe before application settings are loaded.
+Initializes console-only logging from environment variables. This is safe before application settings are loaded. File sinks and queue writing stay disabled during bootstrap, even when their environment flags are enabled.
 
 ```python
 from cells.log import bootstrap_logging, get_logger
@@ -101,6 +113,10 @@ from cells.log import LogConfig, configure_logging
 
 configure_logging(LogConfig(app_name="demo", level="DEBUG", format="text"))
 ```
+
+Reconfiguration prepares the replacement while the current configuration continues serving logs. Preparation failure leaves the current configuration active. Handover briefly gates delivery to drain accepted queue records and transfer file streams; activation failure restores the previous configuration. After a successful switch, old resources are cleaned up while the replacement serves logs.
+
+Use `force=False` to keep an existing production configuration. Call `shutdown_logging()` before process exit to drain queued records and close managed handlers.
 
 ### `configure_logging_from_env()`
 
@@ -135,36 +151,28 @@ When using `configure_logging_from_env(env_prefix="CELLS_LOG")`, supported varia
 | `CELLS_LOG_RETENTION` | Number of rotated files to keep |
 | `CELLS_LOG_SIZE_LIMIT` | Size rotation limit, for example `100MB` |
 | `CELLS_LOG_USE_QUEUE` | Enable in-process `QueueHandler` / `QueueListener` |
+| `CELLS_LOG_QUEUE_CAPACITY` | Maximum number of buffered log records |
+| `CELLS_LOG_QUEUE_FULL_POLICY` | `drop`, `block`, or `sync_fallback` |
 | `CELLS_LOG_CAPTURE_WARNINGS` | Route Python warnings into logging |
+| `CELLS_LOG_MANAGE_ROOT_LOGGER` | Route root logger records through cells-log |
 
 ## Configuration model
 
-```python
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
-
-@dataclass(slots=True)
-class LogConfig:
-    app_name: str = "app"
-    level: str | int = "INFO"
-    format: Literal["json", "text"] = "json"
-    log_dir: Path | str | None = None
-
-    enable_console: bool = True
-    enable_module_file: bool = False
-    enable_total_file: bool = False
-
-    rotation: Literal["daily", "size"] = "daily"
-    retention: int = 14
-    size_limit: str | int = "100MB"
-
-    use_queue: bool = True
-    field_processor: callable | None = None
-    json_dumps: callable = ...
-```
+`LogConfig` controls console and file sinks, rotation, queue backpressure, root/warnings capture, the fallback trace ID and serialization hooks. See [`cells/log/config.py`](cells/log/config.py) for all fields and defaults.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full design boundary.
+
+### Queue backpressure
+
+Production logging uses a bounded queue by default, with a capacity of 10,000 records. Choose `queue_full_policy` according to the application's delivery and latency requirements:
+
+| Policy | Behavior when the queue is full |
+|---|---|
+| `drop` (default) | Discard the record and increment `dropped_records` |
+| `block` | Wait up to `queue_block_timeout` seconds, then discard and count the record |
+| `sync_fallback` | Write the record synchronously on the calling thread |
+
+`get_queue_stats()` returns `enabled`, `capacity`, `depth` and `dropped_records` for the active queue. Set `use_queue=False` for direct synchronous writing.
 
 ## Context propagation
 
@@ -231,13 +239,26 @@ Routing notes:
 - `module_name_prefixes=("app",)` keeps application logs in their own module files.
 - Loggers outside the allowed prefix are routed into `_external.log`.
 - If too many dynamic logger names are created, excess records are routed into `_overflow.log` instead of opening unlimited file descriptors.
+- Names that map to the same file share a rotating handler, including case variants on Windows; each record retains its original logger name.
 
 ## GitHub Actions
 
 This repository includes two workflows:
 
-- `.github/workflows/build.yml`: cross-platform tests and wheel artifact build.
+- `.github/workflows/build.yml`: Python 3.11–3.14 tests on Linux and Windows, wheel artifact build, and GitHub Release publishing.
 - `.github/workflows/publish-pypi.yml`: release/manual wheel build, metadata check and PyPI publish.
+
+After tests and wheel metadata checks pass, `build.yml` publishes the built wheel according to the triggering ref:
+
+| Trigger | GitHub Release |
+|---|---|
+| Push to `main` | Update the `rolling` tag to the tested commit and publish a prerelease titled `rolling` |
+| Push a `v*` tag | Publish a release using the tag as its title |
+| Other pushes, pull requests, manual builds | Build and upload workflow artifacts only |
+
+The rolling release replaces matching wheel assets and removes wheel assets from older versions. It is not marked as the latest stable release. Publishing uses the built-in `GITHUB_TOKEN` with `contents: write` permission limited to the release job.
+
+Releases created with `GITHUB_TOKEN` do not trigger the separate PyPI workflow; use its manual trigger for those builds. See [GitHub's workflow triggering documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
 
 Expected repository secret:
 
@@ -255,18 +276,6 @@ S3_ENDPOINT
 S3_PREFIX
 S3_REGION
 ```
-
-## Pokaemon migration
-
-Use `integrations/pokaemon/log.py` as the replacement adapter for the existing Pokaemon logging module. It preserves these functions:
-
-- `configure_basic_logging()`
-- `configure_full_logging(settings_obj)`
-- `get_logger(name="pokaemon")`
-- `set_trace_id(trace_id)`
-- `reset_trace_id(token)`
-
-The adapter maps Pokaemon settings and `POKAEMON_*` environment variables into `cells_log.LogConfig`.
 
 ## Development
 
