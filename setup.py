@@ -7,6 +7,8 @@ from setuptools import find_namespace_packages, setup
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DIST_NAME = "cells-log"
+MODULE_ROOT = "cells"
 README_FILE = BASE_DIR / "README.md"
 VERSION_FILE = BASE_DIR / "cells" / "log" / "version.py"
 VERSION_PATTERN = re.compile(
@@ -35,7 +37,7 @@ def read_version(version_file: Path) -> str:
 
 
 setup(
-    name="cells-log",
+    name=DIST_NAME,
     version=read_version(VERSION_FILE),
     description=(
         "Structured, bootstrap-safe logging kernel for Python services and CLI applications."
@@ -43,15 +45,10 @@ setup(
     long_description=README_FILE.read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     url="https://github.com/pylab-me/cells-log",
-    project_urls={
-        "Documentation": "https://github.com/pylab-me/cells-log#readme",
-        "Issues": "https://github.com/pylab-me/cells-log/issues",
-        "Source": "https://github.com/pylab-me/cells-log",
-    },
     license="MPL-2.0",
     author="PYLAB",
     author_email="git@pylab.me",
-    packages=find_namespace_packages(include=["cells.log", "cells.log.*"]),
+    packages=find_namespace_packages(include=[f"{MODULE_ROOT}.log", f"{MODULE_ROOT}.log.*"]),
     include_package_data=True,
     zip_safe=False,
     python_requires=">=3.10",
@@ -66,4 +63,9 @@ setup(
         "Topic :: System :: Logging",
     ],
     keywords=["logging", "structured-logging", "json-logs", "observability"],
+    project_urls={
+        "Documentation": "https://github.com/pylab-me/cells-log#readme",
+        "Issues": "https://github.com/pylab-me/cells-log/issues",
+        "Source": "https://github.com/pylab-me/cells-log",
+    },
 )
