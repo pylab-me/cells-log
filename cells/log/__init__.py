@@ -20,7 +20,7 @@ from .manager import (
     get_queue_stats,
     shutdown_logging,
 )
-
+from .timings import TimingCollector
 
 __all__ = [
     "BoundLogger",
@@ -29,6 +29,7 @@ __all__ = [
     "LogConfig",
     "LogStage",
     "TRACE_LEVEL_NUM",
+    "TimingCollector",
     "bind_log_context",
     "bootstrap_logging",
     "config_from_env",

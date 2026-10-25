@@ -51,7 +51,7 @@ setup(
     license="MPL-2.0",
     author="PYLAB",
     author_email="git@pylab.me",
-    packages=find_namespace_packages(include=["cells.*"]),
+    packages=find_namespace_packages(include=["cells.log", "cells.log.*"]),
     include_package_data=True,
     zip_safe=False,
     python_requires=">=3.10",
