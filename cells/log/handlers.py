@@ -96,6 +96,7 @@ class LocalQueueHandler(QueueHandler):
         full_policy: str,
         block_timeout: float,
         fallback_handlers: tuple[logging.Handler, ...],
+        fallback_min_level: int | None = None,
     ) -> None:
         """Bind the bounded queue, full policy and shared sinks without starting a listener."""
         super().__init__(log_queue)
@@ -103,6 +104,11 @@ class LocalQueueHandler(QueueHandler):
         self._full_policy = full_policy
         self._block_timeout = block_timeout
         self._fallback_handlers = fallback_handlers
+        self._fallback_min_level = fallback_min_level
+        self._submitted_records = 0
+        self._block_timeouts = 0
+        self._fallback_delivered_records = 0
+        self._fallback_delivery_errors = 0
         self._dropped_records = 0
         self._accepted_records = 0
         self._fallback_records = 0
@@ -132,15 +138,22 @@ class LocalQueueHandler(QueueHandler):
             else:
                 self.queue.put_nowait(record)
         except queue.Full:
-            if self._full_policy == "sync_fallback":
-                with self._counter_lock:
-                    self._fallback_records += 1
-                self._write_synchronously(record)
-                return
+            fallback = self._full_policy == "sync_fallback" or (
+                self._fallback_min_level is not None and record.levelno >= self._fallback_min_level
+            )
             with self._counter_lock:
-                self._dropped_records += 1
+                self._submitted_records += 1
+                if self._full_policy == "block":
+                    self._block_timeouts += 1
+                if fallback:
+                    self._fallback_records += 1
+                else:
+                    self._dropped_records += 1
+            if fallback:
+                self._write_synchronously(record)
         else:
             with self._counter_lock:
+                self._submitted_records += 1
                 self._accepted_records += 1
                 # Sample depth every 32 accepted events to avoid queue mutex
                 # contention on every producer call. This is NOT a strict peak.
@@ -168,6 +181,14 @@ class LocalQueueHandler(QueueHandler):
                 "enabled": True,
                 "capacity": self.queue.maxsize,
                 "depth": self.queue.qsize(),
+                "submitted_records": self._submitted_records,
+                "pending_records": max(0, self._accepted_records - completed),
+                "block_timeouts": self._block_timeouts,
+                "fallback_delivered_records": self._fallback_delivered_records,
+                "fallback_delivery_errors": self._fallback_delivery_errors,
+                "failed_or_dropped_records": (
+                    self._dropped_records + self._delivery_errors + self._fallback_delivery_errors
+                ),
                 "dropped_records": self._dropped_records,
                 "accepted_records": self._accepted_records,
                 "delivered_records": self._delivered_records,
@@ -183,9 +204,26 @@ class LocalQueueHandler(QueueHandler):
             }
 
     def _write_synchronously(self, record: logging.LogRecord) -> None:
-        for handler in self._fallback_handlers:
-            if record.levelno >= handler.level:
-                handler.handle(record)
+        """Dispatch overflow to every eligible sink and account for failures."""
+        failed = False
+        try:
+            for handler in self._fallback_handlers:
+                if record.levelno < handler.level:
+                    continue
+                try:
+                    handler.handle(record)
+                except Exception:
+                    failed = True
+                    # A sink throwing must not prevent delivery to other sinks.
+                    self.handleError(record)
+                if getattr(record, "_cells_sink_error", False):
+                    failed = True
+        finally:
+            with self._counter_lock:
+                if failed:
+                    self._fallback_delivery_errors += 1
+                else:
+                    self._fallback_delivered_records += 1
 
 
 class SafeQueueListener(QueueListener):
@@ -209,8 +247,8 @@ class SafeQueueListener(QueueListener):
 class MetricsQueueListener(SafeQueueListener):
     """Dispatch a queue and track visible completion/uncaught sink failures.
 
-    Handler implementations that swallow errors via ``handleError`` cannot be
-    measured here, and must expose their own transport-level health metrics.
+    Built-in sink errors are marked on each record. Custom handlers which
+    swallow their own errors need independent health reporting.
     """
 
     def __init__(
@@ -274,6 +312,12 @@ class ModuleFileRouterHandler(logging.Handler):
             # Module router errors are swallowed through logging.handleError.
             record._cells_sink_error = True
             self.handleError(record)
+
+    def flush(self) -> None:
+        """Flush all open per-module files, not only this routing wrapper."""
+        with self._lock:
+            for handler in self._handlers.values():
+                handler.flush()
 
     def close(self) -> None:
         """Close cached files and clear routes, continuing cleanup if an individual close fails."""

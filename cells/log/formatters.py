@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from cells.log.config import LogConfig
 from cells.log.context import get_log_context, get_trace_id
+
+UTC = timezone.utc
 
 
 _COLORS = {

@@ -121,6 +121,11 @@ class LogConfig:
     # Options: <float >= 0>. 0.1 (default) seconds to wait for space under "block", then drop/count.
     # Zero does not wait; this is not a file I/O, handover or shutdown timeout.
     queue_block_timeout: float = 0.1
+    # Options: <str/int level, None>. None (default) keeps the chosen overflow
+    # policy for all records. When set, records at this level or above use
+    # synchronous fallback after a full queue (or a block timeout).
+    # May block the producer and overtake queued records.
+    queue_fallback_min_level: str | int | None = None
     # Options: <True, False>. False (default) stops propagation; True also uses parent loggers,
     # potentially duplicating output. manage_root_logger=True forces False on owned loggers.
     propagate: bool = False
@@ -250,6 +255,7 @@ def config_from_env(
     Environment names use <PREFIX>_<NAME>. Supported names are LEVEL, FORMAT,
     DIR, FILE, ENABLE_CONSOLE, ENABLE_MODULE_FILE, ENABLE_TOTAL_FILE, ROTATION,
     RETENTION, SIZE_LIMIT, USE_QUEUE, QUEUE_CAPACITY, QUEUE_FULL_POLICY,
+    QUEUE_FALLBACK_MIN_LEVEL,
     CAPTURE_WARNINGS and MANAGE_ROOT_LOGGER. Set other fields through base or
     LogConfig. Booleans accept 1/true/yes/y/on and 0/false/no/n/off regardless of
     case. Invalid booleans or integers warn and retain baseline values; empty
@@ -285,6 +291,10 @@ def config_from_env(
             env_key(env_prefix, "QUEUE_FULL_POLICY"),
             cfg.queue_full_policy,
         ).lower(),  # type: ignore[arg-type]
+        queue_fallback_min_level=(
+            os.getenv(env_key(env_prefix, "QUEUE_FALLBACK_MIN_LEVEL"))
+            or cfg.queue_fallback_min_level
+        ),
         capture_warnings=env_bool(env_key(env_prefix, "CAPTURE_WARNINGS"), cfg.capture_warnings),
         manage_root_logger=env_bool(
             env_key(env_prefix, "MANAGE_ROOT_LOGGER"),

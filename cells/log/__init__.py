@@ -17,6 +17,7 @@ from .manager import (
     configure_logging,
     configure_logging_from_env,
     get_logger,
+    flush_logging,
     get_queue_stats,
     shutdown_logging,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "configure_logging_from_env",
     "get_log_context",
     "get_logger",
+    "flush_logging",
     "get_queue_stats",
     "get_trace_id",
     "parse_log_level",

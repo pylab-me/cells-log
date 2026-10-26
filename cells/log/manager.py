@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import atexit
 import logging
+import math
 import os
 import sys
+import time
 import weakref
 import warnings
 from dataclasses import dataclass, field, replace
@@ -265,6 +267,59 @@ class LogManager:
             for graph in [*retired, old_graph]:
                 self._dispose_graph(graph)
 
+    def flush(self, timeout: float | None = None) -> bool:
+        """Drain records accepted before the flush barrier, then flush sinks.
+
+        A successful return means listener dispatch completed and synchronous
+        sink flush() calls returned. This does not imply durable fsync, does not
+        restore records already dropped on queue overflow, and cannot detect
+        failures hidden by custom handlers. ``timeout`` bounds lock acquisition
+        and queue draining, not time spent in an individual sink's flush().
+        Never call from a sink or the queue listener thread.
+
+        Args:
+            timeout: Optional nonnegative number of seconds; None waits indefinitely.
+
+        Returns:
+            False if a required lock or queue drain exceeds the timeout.
+
+        Raises:
+            ValueError: Negative timeout.
+            OSError: A sink raises during flush (including filesystem failures).
+        """
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("flush timeout must be finite and nonnegative")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        acquired = []
+        try:
+            for lock in (self._lifecycle_lock, self._lock, self._switching_handler.lock):
+                if deadline is None:
+                    lock.acquire()
+                    acquired.append(lock)
+                else:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if not lock.acquire(timeout=remaining):
+                        return False
+                    acquired.append(lock)
+            handler = self._queue_handler
+            if handler is not None:
+                log_queue = handler.queue
+                with log_queue.all_tasks_done:
+                    while log_queue.unfinished_tasks:
+                        if deadline is None:
+                            log_queue.all_tasks_done.wait()
+                        else:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                return False
+                            log_queue.all_tasks_done.wait(timeout=remaining)
+            for sink in self._handlers:
+                sink.flush()
+            return True
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
     def get_queue_stats(self) -> dict[str, int | bool | float]:
         """Snapshot queue delivery metrics (reset whenever configured again).
 
@@ -279,6 +334,12 @@ class LogManager:
                     "enabled": False,
                     "capacity": 0,
                     "depth": 0,
+                    "submitted_records": 0,
+                    "pending_records": 0,
+                    "block_timeouts": 0,
+                    "fallback_delivered_records": 0,
+                    "fallback_delivery_errors": 0,
+                    "failed_or_dropped_records": 0,
                     "dropped_records": 0,
                     "accepted_records": 0,
                     "delivered_records": 0,
@@ -370,6 +431,11 @@ class LogManager:
                     full_policy=config.queue_full_policy,
                     block_timeout=config.queue_block_timeout,
                     fallback_handlers=tuple(graph.handlers),
+                    fallback_min_level=(
+                        parse_log_level(config.queue_fallback_min_level)
+                        if config.queue_fallback_min_level is not None
+                        else None
+                    ),
                 )
                 graph.queue_handler.setLevel(graph.level)
                 graph.listener = MetricsQueueListener(
@@ -612,6 +678,16 @@ def shutdown_logging() -> None:
     logging may also be configured again afterward.
     """
     _MANAGER.shutdown()
+
+
+def flush_logging(timeout: float | None = None) -> bool:
+    """Synchronously drain prior accepted records and flush active sinks.
+
+    True means the in-process dispatch barrier completed, not fsync/durability.
+    False indicates queue drain or lock acquisition timed out; any dropped
+    records remain lost. Sink flush exceptions propagate to the caller.
+    """
+    return _MANAGER.flush(timeout)
 
 
 def get_queue_stats() -> dict[str, int | bool | float]:
