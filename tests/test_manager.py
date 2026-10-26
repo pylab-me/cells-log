@@ -41,6 +41,13 @@ def test_public_queue_stats_report_active_configuration(tmp_path: Path) -> None:
         "capacity": 0,
         "depth": 0,
         "dropped_records": 0,
+        "accepted_records": 0,
+        "delivered_records": 0,
+        "fallback_records": 0,
+        "delivery_errors": 0,
+        "max_depth_sampled": 0,
+        "mean_delivery_latency_ms": 0.0,
+        "max_delivery_latency_ms": 0.0,
     }
 
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import sys
+import weakref
 import warnings
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -13,9 +15,10 @@ from threading import RLock
 
 from cells.log.config import LogConfig, config_from_env
 from cells.log.context import get_default_trace_id, set_default_trace_id
-from cells.log.formatters import ConsoleTextFormatter, ContextFilter, JsonLineFormatter
+from cells.log.formatters import ConsoleTextFormatter, JsonLineFormatter
 from cells.log.handlers import (
     LocalQueueHandler,
+    MetricsQueueListener,
     ModuleFileRouterHandler,
     SafeQueueListener,
     SwitchingHandler,
@@ -83,6 +86,19 @@ class _PreparedLoggingGraph:
         return tuple(self.handlers)
 
 
+_LIVE_MANAGERS: weakref.WeakSet[LogManager] = weakref.WeakSet()
+
+
+def _reset_managers_after_fork() -> None:
+    """Avoid dead queues and inherited locks in a forked child."""
+    for manager in list(_LIVE_MANAGERS):
+        manager._reset_after_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_managers_after_fork)
+
+
 class LogManager:
     """Bootstrap-safe logging manager.
 
@@ -95,12 +111,14 @@ class LogManager:
         self._lifecycle_lock = RLock()
         self._lock = RLock()
         self._switching_handler = SwitchingHandler()
+        # Context is injected by SwitchingHandler.emit under the handover lock.
         self._handlers: list[logging.Handler] = []
         self._effective_handlers: list[logging.Handler] = []
         self._queue_listener: SafeQueueListener | None = None
         self._queue_handler: LocalQueueHandler | None = None
         self._retired_graphs: list[_PreparedLoggingGraph] = []
         self._logger_cache: dict[str, logging.Logger] = {}
+        self._owned_logger_states: dict[str, _LoggerState] = {}
         self._config = LogConfig().normalized()
         self._root_state: _LoggerState | None = None
         self._warnings_state: _LoggerState | None = None
@@ -109,6 +127,25 @@ class LogManager:
         self._stage = LogStage.UNINITIALIZED
         self.bootstrap()
         atexit.register(self.shutdown)
+        _LIVE_MANAGERS.add(self)
+
+    def _reset_after_fork(self) -> None:
+        """Detach parent listeners/sinks; worker must configure its own graph.
+
+        Do not join, stop, or close inherited queue/file resources here. The
+        parent's background listener is absent and rotated files are not
+        cross-process safe. Logging is intentionally muted until reconfigure.
+        """
+        self._lifecycle_lock = RLock()
+        self._lock = RLock()
+        self._switching_handler.createLock()
+        self._switching_handler._handlers = ()
+        self._handlers = []
+        self._effective_handlers = []
+        self._queue_handler = None
+        self._queue_listener = None
+        self._retired_graphs = []
+        self._stage = LogStage.SHUTDOWN
 
     @property
     def stage(self) -> LogStage:
@@ -190,6 +227,7 @@ class LogManager:
             raw_logger = self._logger_cache.get(logger_name)
             if raw_logger is None:
                 raw_logger = logging.getLogger(logger_name)
+                self._owned_logger_states[logger_name] = _LoggerState(raw_logger)
                 self._logger_cache[logger_name] = raw_logger
 
             self._sync_logger(raw_logger)
@@ -217,18 +255,21 @@ class LogManager:
                 self._queue_listener = None
                 self._queue_handler = None
                 self._restore_external_loggers()
+                for state in self._owned_logger_states.values():
+                    state.restore()
+                self._owned_logger_states.clear()
+                self._logger_cache.clear()
                 self._stage = LogStage.SHUTDOWN
                 retired, self._retired_graphs = self._retired_graphs, []
             for graph in [*retired, old_graph]:
                 self._dispose_graph(graph)
 
-    def get_queue_stats(self) -> dict[str, int | bool]:
-        """Return current queue statistics, reset with each newly configured queue.
+    def get_queue_stats(self) -> dict[str, int | bool | float]:
+        """Snapshot queue delivery metrics (reset whenever configured again).
 
-        enabled indicates an active queue; capacity counts records. depth is an
-        approximate queue length, excluding records already dequeued but not yet
-        written. dropped_records counts only full-queue discards, not file write
-        failures. Without a queue, enabled is False and all other values are zero.
+        Delivered means listener dispatch returned, not guaranteed durable write.
+        ``max_depth_sampled`` is sampled, not a strict peak.  Sink handlers that
+        swallow their own I/O errors may be invisible to ``delivery_errors``.
         """
         with self._lock:
             if self._queue_handler is None:
@@ -237,14 +278,15 @@ class LogManager:
                     "capacity": 0,
                     "depth": 0,
                     "dropped_records": 0,
+                    "accepted_records": 0,
+                    "delivered_records": 0,
+                    "fallback_records": 0,
+                    "delivery_errors": 0,
+                    "max_depth_sampled": 0,
+                    "mean_delivery_latency_ms": 0.0,
+                    "max_delivery_latency_ms": 0.0,
                 }
-            log_queue = self._queue_handler.queue
-            return {
-                "enabled": True,
-                "capacity": log_queue.maxsize,
-                "depth": log_queue.qsize(),
-                "dropped_records": self._queue_handler.dropped_records,
-            }
+            return self._queue_handler.stats()
 
     def _build_handlers(
         self,
@@ -264,7 +306,11 @@ class LogManager:
                 include_fields=config.console_include_fields,
                 include_exception=config.console_include_exception,
             )
-            file_formatter = JsonLineFormatter(config, include_fields=True, include_exception=True)
+            file_formatter = (
+                console_formatter
+                if config.console_include_fields and config.console_include_exception
+                else JsonLineFormatter(config, include_fields=True, include_exception=True)
+            )
         else:
             console_formatter = ConsoleTextFormatter(
                 config,
@@ -277,20 +323,16 @@ class LogManager:
                 config, include_fields=True, include_exception=True
             )
 
-        context_filter = ContextFilter()
-
         if config.enable_console:
             stream = sys.stderr if config.console_to_stderr else sys.stdout
             console_handler = logging.StreamHandler(stream)
             handlers.append(console_handler)
             console_handler.setLevel(level)
             console_handler.setFormatter(console_formatter)
-            console_handler.addFilter(context_filter)
 
         if config.enable_module_file:
             module_handler = ModuleFileRouterHandler(config, file_formatter, level)
             handlers.append(module_handler)
-            module_handler.addFilter(context_filter)
 
         if config.enable_total_file:
             total_path = self._resolve_total_file(config)
@@ -298,7 +340,6 @@ class LogManager:
                 total_path, config, file_formatter, level, delay=True
             )
             handlers.append(total_handler)
-            total_handler.addFilter(context_filter)
 
     def _resolve_total_file(self, config: LogConfig) -> Path:
         if config.log_dir is None:
@@ -329,9 +370,8 @@ class LogManager:
                     fallback_handlers=tuple(graph.handlers),
                 )
                 graph.queue_handler.setLevel(graph.level)
-                graph.queue_handler.addFilter(ContextFilter())
-                graph.listener = SafeQueueListener(
-                    log_queue, *graph.handlers, respect_handler_level=True
+                graph.listener = MetricsQueueListener(
+                    log_queue, *graph.handlers, metrics=graph.queue_handler
                 )
                 graph.listener.start()
             return graph
@@ -572,6 +612,6 @@ def shutdown_logging() -> None:
     _MANAGER.shutdown()
 
 
-def get_queue_stats() -> dict[str, int | bool]:
-    """Return enabled/capacity/depth/dropped_records; see LogManager.get_queue_stats()."""
+def get_queue_stats() -> dict[str, int | bool | float]:
+    """Return bounded-queue acceptance, delivery, loss and latency metrics."""
     return _MANAGER.get_queue_stats()

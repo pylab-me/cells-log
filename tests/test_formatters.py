@@ -38,7 +38,7 @@ def test_field_processor_failure_is_isolated() -> None:
 
     payload = json.loads(JsonLineFormatter(LogConfig(field_processor=fail)).format(_record()))
 
-    assert payload["fields"]["_field_processor_error"] == "RuntimeError: processor failed"
+    assert payload["fields"]["_field_processor_error"] == "RuntimeError"
 
 
 def test_exception_formatter_includes_traceback() -> None:

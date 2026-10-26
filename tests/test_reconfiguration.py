@@ -19,7 +19,7 @@ from cells.log.context import (
     reset_trace_id,
     set_trace_id,
 )
-from cells.log.handlers import ModuleFileRouterHandler, SafeQueueListener
+from cells.log.handlers import ModuleFileRouterHandler, MetricsQueueListener, SafeQueueListener
 from cells.log.manager import LogManager, LogStage
 
 
@@ -109,7 +109,7 @@ def test_listener_start_failure_releases_candidates(
     logger = manager.get_logger("transaction.listener")
     previous_listener = manager._queue_listener
     candidates = []
-    listener_type = SafeQueueListener
+    listener_type = MetricsQueueListener
     start = listener_type.start
 
     class _FailingListener(listener_type):
@@ -129,7 +129,7 @@ def test_listener_start_failure_releases_candidates(
                 raise KeyboardInterrupt("candidate interrupted")
             raise RuntimeError("candidate startup failed")
 
-    monkeypatch.setattr(manager_module, "SafeQueueListener", _FailingListener)
+    monkeypatch.setattr(manager_module, "MetricsQueueListener", _FailingListener)
     expected = KeyboardInterrupt if failure == "interrupt" else RuntimeError
     try:
         with pytest.raises(expected):
@@ -402,7 +402,7 @@ def test_old_graph_serves_while_candidate_is_preparing(
         if pause_at == "build":
             pause_preparation()
 
-    class _PausedListener(SafeQueueListener):
+    class _PausedListener(MetricsQueueListener):
         def start(self):
             super().start()
             if pause_at == "listener":
@@ -431,7 +431,7 @@ def test_old_graph_serves_while_candidate_is_preparing(
         except BaseException as exc:
             failures.append(exc)
 
-    monkeypatch.setattr(manager_module, "SafeQueueListener", _PausedListener)
+    monkeypatch.setattr(manager_module, "MetricsQueueListener", _PausedListener)
     monkeypatch.setattr(manager, "_build_handlers", paused_build)
     reloader = Thread(target=configure, daemon=True)
     producer = Thread(target=produce, daemon=True)
@@ -509,7 +509,7 @@ def test_same_file_rotates_during_preparation_and_retired_cleanup(
     attribute = "stop" if old_queue else "close"
     cleanup = getattr(target, attribute)
 
-    class _PausedListener(SafeQueueListener):
+    class _PausedListener(MetricsQueueListener):
         def start(self):
             super().start()
             preparing.set()
@@ -536,7 +536,7 @@ def test_same_file_rotates_during_preparation_and_retired_cleanup(
         except BaseException as exc:
             failures.append(exc)
 
-    monkeypatch.setattr(manager_module, "SafeQueueListener", _PausedListener)
+    monkeypatch.setattr(manager_module, "MetricsQueueListener", _PausedListener)
     monkeypatch.setattr(target, attribute, paused_cleanup)
     reloader = Thread(target=configure, daemon=True)
     producers = []
@@ -593,7 +593,7 @@ def test_lifecycle_calls_serialize_without_blocking_live_logging(
     second_started, second_finished = Event(), Event()
     failures = []
 
-    class _PausedListener(SafeQueueListener):
+    class _PausedListener(MetricsQueueListener):
         def start(self):
             super().start()
             preparing.set()
@@ -619,7 +619,7 @@ def test_lifecycle_calls_serialize_without_blocking_live_logging(
         finally:
             second_finished.set()
 
-    monkeypatch.setattr(manager_module, "SafeQueueListener", _PausedListener)
+    monkeypatch.setattr(manager_module, "MetricsQueueListener", _PausedListener)
     first = Thread(target=first_call, daemon=True)
     second = Thread(target=second_call, daemon=True)
     try:

@@ -164,7 +164,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design boundary.
 
 ### Queue backpressure
 
-Production logging uses a bounded queue by default, with a capacity of 10,000 records. Choose `queue_full_policy` according to the application's delivery and latency requirements:
+In **v0.3.0** the default is **synchronous delivery** (`use_queue=False`): for fast stdout or local file sinks a background listener may add CPU overhead instead of improving throughput. Opt into `use_queue=True` when application threads must avoid a **slow** file/network sink and can tolerate buffered delivery. The in-process queue is bounded (default capacity: 10,000 records). Choose `queue_full_policy` according to latency and loss requirements:
 
 | Policy | Behavior when the queue is full |
 |---|---|
@@ -172,7 +172,9 @@ Production logging uses a bounded queue by default, with a capacity of 10,000 re
 | `block` | Wait up to `queue_block_timeout` seconds, then discard and count the record |
 | `sync_fallback` | Write the record synchronously on the calling thread |
 
-`get_queue_stats()` returns `enabled`, `capacity`, `depth` and `dropped_records` for the active queue. Set `use_queue=False` for direct synchronous writing.
+`get_queue_stats()` returns `enabled`, `capacity`, `depth`, `dropped_records`, `accepted_records`, `delivered_records`, `fallback_records`, `delivery_errors`, `max_depth_sampled`, `mean_delivery_latency_ms`, and `max_delivery_latency_ms` for the active queue. The queue counters reset when the queue is replaced. `delivered_records` means the listener invoked the sink handler(s), **not** that bytes reached durable storage. `delivery_errors` observes exceptions escaping sink handlers; errors swallowed by stdlib handlers are not visible. `max_depth_sampled` checks one event in 32, not the exact queue peak. `sync_fallback` delivery is reported separately and may reorder events.
+
+**Workload selection:** sync mode is the default for CLI, standard container stdout, and ordinary local files. Queue mode is opt-in for potentially blocking sinks and for latency-sensitive producer threads; benchmark both modes on the target deployment. The included benchmark tool compares sync/queue with discard, rotating file, and dual sinks: `python benchmarks/logging_benchmark.py --count 10000 --repeats 5`. Full results and profiling commands are in [`benchmarks/README.md`](benchmarks/README.md).
 
 ## Context propagation
 
@@ -210,15 +212,27 @@ def field_processor(fields: dict) -> dict:
 configure_logging(LogConfig(field_processor=field_processor))
 ```
 
+**Security:** Field processors receive a shallow copy of merged business fields and run at most once per record, even with multiple sinks. If the processor raises or returns an invalid mapping, the complete input field dictionary is discarded and only a sanitized `_field_processor_error` type is emitted. Do not embed secrets in the free-form message or exception text: those are **not** processed by this hook.
+
+Standard `logging.getLogger("library").warning("event", extra={"duration_ms": 123})` fields are emitted as JSON fields when `manage_root_logger=True`, without accidentally emitting reserved `LogRecord` internals.
+
 Custom JSON serializer:
 
 ```python
-from cells import json
+import json
 from cells.log import LogConfig, configure_logging
 
 
 configure_logging(LogConfig(json_dumps=json.dumps))
 ```
+
+## Fork and multi-worker deployment
+
+When a parent has already initialized logging and forks, cells-log detaches inherited queue listeners and sinks in the child. The child intentionally **does not log through the inherited graph**; configure an independent `LogConfig` inside each worker before emitting logs. This avoids waiting forever on a parent-only listener. If `manage_root_logger` is enabled, the child should likewise configure it for its own worker lifecycle.
+
+**Do not point multiple processes at the same rotating log file.** Standard rotating handlers are process-local. For Gunicorn/multiprocessing-style deployments, prefer per-worker JSON stdout collected by the deployment runtime or give each worker distinct file paths. Fork reinitialization does not turn local files into multi-process-safe sinks.
+
+Logger names acquired through `get_logger()` temporarily replace their stdlib handlers/level; original states are restored by `shutdown_logging()`. Root/warnings capture remains opt-in.
 
 ## File layout
 

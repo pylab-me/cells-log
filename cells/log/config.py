@@ -38,15 +38,15 @@ def _default_json_dumps(obj: Any, **kwargs: Any) -> str:
 class LogConfig:
     """Configure output, file rotation, queueing and context extensions.
 
-    Defaults apply to explicit production configuration: console JSON with an
-    in-process queue, no files, no root ownership and no warnings capture.
+    Defaults apply to explicit production configuration: console JSON with
+    synchronous delivery, no files, no root ownership and no warnings capture.
     Bootstrap always disables files and the queue. Callers map application
     settings to this object; changing it does not reconfigure active handlers.
     Call configure_logging() again to apply changes.
 
-    Fields merge in context < bind < call order; later values win. Field hooks
-    receive shallow copies and may run repeatedly per record, once per sink,
-    in the listener or caller thread. JSON hooks must return str and handle
+    Fields merge in context < stdlib extra < bind < call order; later values win. Field hooks
+    receive shallow copies once per record on first sink formatting,
+    in the listener or caller thread. Failures discard all original fields. JSON hooks must return str and handle
     non-JSON objects. They receive ensure_ascii=False, with one retry without
     that keyword on TypeError; they also encode text output's field suffixes.
     """
@@ -69,12 +69,12 @@ class LogConfig:
     # Options: <True, False>. True (default) writes to stderr; False writes to stdout.
     # Configuration diagnostics always use stderr.
     console_to_stderr: bool = True
-    # Options: <True, False>. False (default) hides console fields; True includes them.
+    # Options: <True, False>. True (default) includes console fields.
     # Files always include fields; simplified text errors omit them on the console.
-    console_include_fields: bool = False
-    # Options: <True, False>. False (default) hides console tracebacks; True includes them.
+    console_include_fields: bool = True
+    # Options: <True, False>. True (default) includes console tracebacks.
     # Files retain available exceptions; simplified text errors omit console tracebacks.
-    console_include_exception: bool = False
+    console_include_exception: bool = True
     # Options: <True, False>. True (default) shows only a summary and "details in log file"
     # for console text errors >= ERROR when files are enabled; False keeps normal detail.
     simplify_console_errors: bool = True
@@ -109,9 +109,9 @@ class LogConfig:
     # Size rotation only; units use powers of 1024. A per-file threshold, not a total disk quota.
     size_limit: str | int = "100MB"
 
-    # Options: <True, False>. True (default) uses a process-local listener; False writes in caller.
+    # Options: <True, False>. False (default) writes synchronously; True uses a local listener.
     # No crash delivery guarantee; bootstrap always disables the queue.
-    use_queue: bool = True
+    use_queue: bool = False
     # Options: <int >= 1>. 10_000 (default) queued records, excluding in-flight writes.
     # Applies only with use_queue=True and active output sinks.
     queue_capacity: int = 10_000
@@ -138,7 +138,7 @@ class LogConfig:
     # Updated only after configuration activation succeeds.
     default_trace_id: str = "system"
     # Options: <None, callable>. None (default) keeps merged fields; callable returns new fields.
-    # On failure, retain original fields and add _field_processor_error. See hook rules above.
+    # On failure, discard ALL fields and add only _field_processor_error (exception type).
     field_processor: FieldProcessor | None = None
     # Options: <callable>. _default_json_dumps (default) uses ensure_ascii=False and default=str.
     # Custom encoders must return str; see hook rules above for invocation and retry behavior.

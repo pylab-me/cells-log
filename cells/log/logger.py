@@ -128,13 +128,13 @@ class BoundLogger:
 
     def _log(self, _level: int, _message: str, _exc_info: bool, /, **fields: Any) -> None:
         # Private positional-only parameters leave even identically named business fields intact.
-        if not self.is_enabled_for(_level):
+        if not self._logger.isEnabledFor(_level):
             return
         merged_fields = {**self._context, **fields}
         self._logger.log(
             _level,
             _message,
-            extra={"_fields": merged_fields},
+            extra={"_fields": merged_fields, "_cells_owned": True},
             exc_info=_exc_info,
             stacklevel=3,
         )

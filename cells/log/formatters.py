@@ -40,6 +40,11 @@ class ContextFilter(logging.Filter):
         return True
 
 
+# Internal LogRecord attributes and standard logging fields must not leak into
+# third-party ``extra`` fields.  Calculated once, not on the formatting hot path.
+_STANDARD_RECORD_KEYS = frozenset(logging.makeLogRecord({}).__dict__)
+
+
 class _BaseCellsFormatter(logging.Formatter):
     def __init__(self, config: LogConfig, *, include_fields: bool, include_exception: bool) -> None:
         super().__init__()
@@ -53,20 +58,40 @@ class _BaseCellsFormatter(logging.Formatter):
         return datetime.fromtimestamp(record.created).isoformat()
 
     def _fields(self, record: logging.LogRecord) -> dict[str, Any]:
+        # Share normalization among console, module and aggregate sinks.  A hook
+        # must never have different outcomes for the same event.
+        cached = getattr(record, "_cells_processed_fields", None)
+        if cached is not None:
+            return cached
+
         context_fields = getattr(record, "_context_fields", None) or {}
         bound_fields = getattr(record, "_fields", None) or {}
-        fields = {**context_fields, **bound_fields}
+        # Standard third-party logging.Logger(..., extra={...}) is supported.
+        # Never surface internal/private record properties or stdlib metadata.
+        external_fields = (
+            {}
+            if getattr(record, "_cells_owned", False)
+            else {
+                key: value
+                for key, value in record.__dict__.items()
+                if key not in _STANDARD_RECORD_KEYS
+                and not key.startswith("_")
+                and key != "trace_id"
+            }
+        )
+        fields = {**context_fields, **external_fields, **bound_fields}
 
         if self._config.field_processor is None:
-            return fields
-
-        try:
-            processed = self._config.field_processor(dict(fields))
-            return dict(processed)
-        except Exception as exc:  # logging must not break business flow
-            fallback = dict(fields)
-            fallback["_field_processor_error"] = f"{type(exc).__name__}: {exc}"
-            return fallback
+            result = fields
+        else:
+            try:
+                result = dict(self._config.field_processor(dict(fields)))
+            except Exception as exc:
+                # Fail closed: a failed redaction hook must NEVER return secrets.
+                # Exclude the exception message; it too may contain secrets.
+                result = {"_field_processor_error": type(exc).__name__}
+        record._cells_processed_fields = result
+        return result
 
     def _exception_text(self, record: logging.LogRecord) -> str | None:
         if not self._include_exception or not record.exc_info:
@@ -83,6 +108,9 @@ class JsonLineFormatter(_BaseCellsFormatter):
         super().__init__(config, include_fields=include_fields, include_exception=include_exception)
 
     def format(self, record: logging.LogRecord) -> str:
+        cached = getattr(record, "_cells_json_render", None)
+        if cached is not None and cached[0] is self:
+            return cached[1]
         payload: dict[str, Any] = {
             "timestamp": self._timestamp(record),
             "level": record.levelname,
@@ -102,9 +130,11 @@ class JsonLineFormatter(_BaseCellsFormatter):
             payload["exception"] = exception
 
         try:
-            return self._config.json_dumps(payload, ensure_ascii=False)
+            result = self._config.json_dumps(payload, ensure_ascii=False)
         except TypeError:
-            return self._config.json_dumps(payload)
+            result = self._config.json_dumps(payload)
+        record._cells_json_render = (self, result)
+        return result
 
 
 class ConsoleTextFormatter(_BaseCellsFormatter):

@@ -6,6 +6,7 @@ import copy
 import logging
 import queue
 import re
+import time
 from collections.abc import Iterable
 from contextlib import suppress
 from logging.handlers import (
@@ -19,6 +20,7 @@ from threading import RLock
 
 from cells.log.config import LogConfig
 from cells.log.env import parse_size_limit
+from cells.log.formatters import ContextFilter
 
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -30,6 +32,7 @@ class SwitchingHandler(logging.Handler):
         """Initialize an empty handler group."""
         super().__init__()
         self._handlers: tuple[logging.Handler, ...] = ()
+        self._context_filter = ContextFilter()
 
     def replace_handlers(self, handlers: tuple[logging.Handler, ...]) -> None:
         """Replace sinks under the same lock used for record delivery."""
@@ -41,6 +44,9 @@ class SwitchingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         """Deliver a record to the current sinks while handle() holds the lock."""
+        if self._handlers:
+            # Capture ContextVar once AFTER handover's switch lock is acquired.
+            self._context_filter.filter(record)
         for handler in self._handlers:
             if record.levelno >= handler.level:
                 handler.handle(record)
@@ -50,7 +56,7 @@ class LocalQueueHandler(QueueHandler):
     """QueueHandler variant for in-process logging.
 
     The stdlib QueueHandler.prepare() clears exc_info for pickle-safety. cells-log
-    uses an in-process queue by default, so we keep a shallow copy of the record
+    uses an optional in-process queue, so we keep a shallow copy of the record
     to preserve exception details for downstream file formatters.
 
     Only the record shell is copied; mutable field values are not frozen. Callers
@@ -74,6 +80,13 @@ class LocalQueueHandler(QueueHandler):
         self._block_timeout = block_timeout
         self._fallback_handlers = fallback_handlers
         self._dropped_records = 0
+        self._accepted_records = 0
+        self._fallback_records = 0
+        self._delivered_records = 0
+        self._delivery_errors = 0
+        self._queue_max_depth_sampled = 0
+        self._total_delivery_latency_ns = 0
+        self._max_delivery_latency_ns = 0
         self._counter_lock = RLock()
 
     @property
@@ -88,6 +101,7 @@ class LocalQueueHandler(QueueHandler):
 
     def enqueue(self, record: logging.LogRecord) -> None:
         """Enqueue a record according to the configured backpressure policy."""
+        record._cells_enqueued_ns = time.perf_counter_ns()
         try:
             if self._full_policy == "block":
                 self.queue.put(record, block=True, timeout=self._block_timeout)
@@ -95,10 +109,54 @@ class LocalQueueHandler(QueueHandler):
                 self.queue.put_nowait(record)
         except queue.Full:
             if self._full_policy == "sync_fallback":
+                with self._counter_lock:
+                    self._fallback_records += 1
                 self._write_synchronously(record)
                 return
             with self._counter_lock:
                 self._dropped_records += 1
+        else:
+            with self._counter_lock:
+                self._accepted_records += 1
+                # Sample depth every 32 accepted events to avoid queue mutex
+                # contention on every producer call. This is NOT a strict peak.
+                if self._accepted_records % 32 == 0:
+                    self._queue_max_depth_sampled = max(
+                        self._queue_max_depth_sampled, self.queue.qsize()
+                    )
+
+    def delivery_finished(self, record: logging.LogRecord, *, failed: bool) -> None:
+        """Track completed listener dispatch and elapsed queue + sink time."""
+        latency_ns = time.perf_counter_ns() - record._cells_enqueued_ns
+        with self._counter_lock:
+            if failed:
+                self._delivery_errors += 1
+            else:
+                self._delivered_records += 1
+            self._total_delivery_latency_ns += latency_ns
+            self._max_delivery_latency_ns = max(self._max_delivery_latency_ns, latency_ns)
+
+    def stats(self) -> dict[str, int | bool | float]:
+        """Return atomic queue submission and consumer delivery counters."""
+        with self._counter_lock:
+            completed = self._delivered_records + self._delivery_errors
+            return {
+                "enabled": True,
+                "capacity": self.queue.maxsize,
+                "depth": self.queue.qsize(),
+                "dropped_records": self._dropped_records,
+                "accepted_records": self._accepted_records,
+                "delivered_records": self._delivered_records,
+                "fallback_records": self._fallback_records,
+                "delivery_errors": self._delivery_errors,
+                "max_depth_sampled": self._queue_max_depth_sampled,
+                "mean_delivery_latency_ms": (
+                    round(self._total_delivery_latency_ns / completed / 1_000_000, 3)
+                    if completed
+                    else 0.0
+                ),
+                "max_delivery_latency_ms": round(self._max_delivery_latency_ns / 1_000_000, 3),
+            }
 
     def _write_synchronously(self, record: logging.LogRecord) -> None:
         for handler in self._fallback_handlers:
@@ -122,6 +180,33 @@ class SafeQueueListener(QueueListener):
             self._thread = None
             return
         super().stop()
+
+
+class MetricsQueueListener(SafeQueueListener):
+    """Dispatch a queue and track visible completion/uncaught sink failures.
+
+    Handler implementations that swallow errors via ``handleError`` cannot be
+    measured here, and must expose their own transport-level health metrics.
+    """
+
+    def __init__(
+        self,
+        log_queue: queue.Queue[logging.LogRecord],
+        *handlers: logging.Handler,
+        metrics: LocalQueueHandler,
+    ) -> None:
+        super().__init__(log_queue, *handlers, respect_handler_level=True)
+        self._metrics = metrics
+
+    def handle(self, record: logging.LogRecord) -> None:
+        try:
+            super().handle(record)
+        except Exception:
+            self._metrics.delivery_finished(record, failed=True)
+            # Keep accepting future events rather than killing the listener.
+            self._metrics.handleError(record)
+        else:
+            self._metrics.delivery_finished(record, failed=False)
 
 
 class ModuleFileRouterHandler(logging.Handler):
