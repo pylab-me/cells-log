@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from cells.log.env import (
     env_bool,
+    env_console_color,
     env_int,
     env_key,
     env_path,
@@ -21,6 +22,7 @@ from cells.log.env import (
 )
 
 LogFormat = Literal["json", "text"]
+ConsoleColor = Literal[False, True, "auto", "always"]
 RotationMode = Literal["daily", "size"]
 QueueFullPolicy = Literal["drop", "block", "sync_fallback"]
 # Transform merged structured fields without processing the message or exception text.
@@ -75,6 +77,10 @@ class LogConfig:
     # Options: <True, False>. True (default) writes to stderr; False writes to stdout.
     # Configuration diagnostics always use stderr.
     console_to_stderr: bool = True
+    # Options: False (default), True/"auto", "always". False disables ANSI entirely.
+    # True/"auto" colors text only when the selected output stream is a TTY;
+    # "always" forces ANSI even through Docker pipes. JSON and files stay plain.
+    console_color: ConsoleColor = False
     # Options: <True, False>. True (default) includes console fields.
     # Files always include fields; simplified text errors omit them on the console.
     console_include_fields: bool = True
@@ -178,6 +184,10 @@ class LogConfig:
         format_for_file = (
             None if self.format_for_file is None else str(self.format_for_file).lower()
         )
+        color = self.console_color
+        console_color: ConsoleColor = (
+            color if color is False or color is True or color in ("auto", "always") else False
+        )
         queue_full_policy: QueueFullPolicy = (
             self.queue_full_policy
             if self.queue_full_policy in {"drop", "block", "sync_fallback"}
@@ -186,6 +196,7 @@ class LogConfig:
         normalized = replace(
             self,
             format=fmt,
+            console_color=console_color,
             capture_loggers=tuple(self.capture_loggers),
             format_for_console=(
                 "text"
@@ -211,6 +222,14 @@ class LogConfig:
             queue_block_timeout=max(0.0, float(self.queue_block_timeout)),
         )
         for name, valid, allowed, risk in (
+            (
+                "console_color",
+                self.console_color is False
+                or self.console_color is True
+                or self.console_color in ("auto", "always"),
+                "False, True, auto, always",
+                "ANSI escapes may be emitted to an unintended consumer",
+            ),
             (
                 "format",
                 str(self.format).lower() in {"json", "text"},
@@ -301,6 +320,12 @@ class LogConfig:
                 raw is not None and str(raw).lower() not in {"json", "text"}
             ):
                 raise ValueError(f"{name} must be 'json' or 'text'")
+        if not (
+            self.console_color is False
+            or self.console_color is True
+            or self.console_color in ("auto", "always")
+        ):
+            raise ValueError("console_color must be False, True, 'auto' or 'always'")
         if str(self.rotation).lower() not in {"daily", "size"}:
             raise ValueError("rotation must be 'daily' or 'size'")
         if self.queue_full_policy not in {"drop", "block", "sync_fallback"}:
@@ -360,7 +385,7 @@ def config_from_env(
 
     Environment names use <PREFIX>_<NAME>. Supported names are LEVEL, FORMAT,
     FORMAT_FOR_CONSOLE, FORMAT_FOR_FILE, CAPTURE_LOGGERS,
-    DIR, FILE, ENABLE_CONSOLE, ENABLE_MODULE_FILE, ENABLE_TOTAL_FILE, ROTATION,
+    DIR, FILE, ENABLE_CONSOLE, CONSOLE_COLOR, ENABLE_MODULE_FILE, ENABLE_TOTAL_FILE, ROTATION,
     RETENTION, SIZE_LIMIT, USE_QUEUE, QUEUE_CAPACITY, QUEUE_FULL_POLICY,
     QUEUE_FALLBACK_MIN_LEVEL,
     CAPTURE_WARNINGS and MANAGE_ROOT_LOGGER. Set other fields through base or
@@ -393,6 +418,7 @@ def config_from_env(
         log_dir=log_dir,
         total_file=total_file,
         enable_console=env_bool(env_key(env_prefix, "ENABLE_CONSOLE"), cfg.enable_console),
+        console_color=env_console_color(env_key(env_prefix, "CONSOLE_COLOR"), cfg.console_color),
         enable_module_file=env_bool(
             env_key(env_prefix, "ENABLE_MODULE_FILE"), cfg.enable_module_file
         ),

@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TextIO
 
-from cells.log.config import LogConfig
+from cells.log.config import ConsoleColor, LogConfig
 from cells.log.context import get_log_context, get_trace_id
 
 UTC = timezone.utc
@@ -23,6 +22,25 @@ _COLORS = {
     "CRITICAL": "\033[41;37m",
     "RESET": "\033[0m",
 }
+
+
+def console_colors_enabled(mode: ConsoleColor, stream: TextIO) -> bool:
+    """Resolve opt-in ANSI mode against the actual output stream.
+
+    Docker usually exposes pipes to the application, even if the eventual
+    ``docker compose logs -f`` viewer supports ANSI. Choose "always" explicitly
+    when the deployer knows that consumer supports it.
+    """
+    if mode is False:
+        return False
+    if mode == "always":
+        return True
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 class ContextFilter(logging.Filter):
@@ -149,8 +167,10 @@ class ConsoleTextFormatter(_BaseCellsFormatter):
         include_exception: bool = False,
         simplify_console_errors: bool = False,
         detail_sink_enabled: bool = False,
+        use_color: bool = False,
     ) -> None:
         super().__init__(config, include_fields=include_fields, include_exception=include_exception)
+        self._use_color = use_color
         self._simplify_console_errors = simplify_console_errors
         self._detail_sink_enabled = detail_sink_enabled
 
@@ -159,9 +179,8 @@ class ConsoleTextFormatter(_BaseCellsFormatter):
         trace_id = getattr(record, "trace_id", self._config.default_trace_id)
         level_char = record.levelname[0]
 
-        use_color = sys.stderr.isatty() and os.name != "nt"
-        color = _COLORS.get(record.levelname, "") if use_color else ""
-        reset = _COLORS["RESET"] if use_color else ""
+        color = _COLORS.get(record.levelname, "") if self._use_color else ""
+        reset = _COLORS["RESET"] if self._use_color else ""
         level_fmt = f"{color}[{level_char}]{reset}"
 
         if (

@@ -17,7 +17,7 @@ from threading import RLock
 
 from cells.log.config import LogConfig, config_from_env
 from cells.log.context import get_default_trace_id, set_default_trace_id
-from cells.log.formatters import ConsoleTextFormatter, JsonLineFormatter
+from cells.log.formatters import ConsoleTextFormatter, JsonLineFormatter, console_colors_enabled
 from cells.log.handlers import (
     LocalQueueHandler,
     MetricsQueueListener,
@@ -385,6 +385,7 @@ class LogManager:
         file_formatter: logging.Formatter
         console_format = config.format_for_console or config.format
         file_format = config.format_for_file or config.format
+        stream = sys.stderr if config.console_to_stderr else sys.stdout
         if console_format == "json":
             console_formatter = JsonLineFormatter(
                 config,
@@ -398,6 +399,9 @@ class LogManager:
                 include_exception=config.console_include_exception,
                 simplify_console_errors=config.simplify_console_errors,
                 detail_sink_enabled=detail_sink_enabled,
+                use_color=console_colors_enabled(config.console_color, stream)
+                if config.enable_console
+                else False,
             )
         if file_format == "json":
             file_formatter = (
@@ -413,7 +417,6 @@ class LogManager:
             )
 
         if config.enable_console:
-            stream = sys.stderr if config.console_to_stderr else sys.stdout
             console_handler = _TrackedStreamHandler(stream)
             handlers.append(console_handler)
             console_handler.setLevel(level)

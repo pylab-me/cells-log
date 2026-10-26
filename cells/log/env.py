@@ -49,6 +49,31 @@ def env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def env_console_color(name: str, default: bool | str) -> bool | str:
+    """Read console ANSI preference: false (default), auto, or always.
+
+    A true-like value opts into auto TTY detection, rather than forcing ANSI.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _FALSE_VALUES or value == "never":
+        return False
+    if value in _TRUE_VALUES or value == "auto":
+        return "auto"
+    if value in {"always", "force"}:
+        return "always"
+    warn_config_fallback(
+        name,
+        raw,
+        default,
+        allowed="false/true, auto, always (also 0/1, no/yes, off/on)",
+        risk="ANSI escapes may be emitted to an unintended consumer",
+    )
+    return default
+
+
 def env_int(name: str, default: int) -> int:
     """Read an integer, warning and using the default if invalid; do not check ranges."""
     raw = os.getenv(name)

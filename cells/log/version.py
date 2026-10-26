@@ -52,4 +52,4 @@ Trace and bound fields are copied per record; ContextVar values are isolated
 per asynchronous task. Synchronous overflow fallback can block and reorder.
 """
 
-__VERSION__ = "0.3.3"
+__VERSION__ = "0.3.4"
