@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import Any
+from typing import Any, Iterator
 
 _trace_id_var: ContextVar[str | None] = ContextVar("cells_log_trace_id", default=None)
 _context_fields_var: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -65,3 +66,24 @@ def reset_log_context(token: Token[dict[str, Any] | None]) -> None:
 def get_log_context() -> dict[str, Any]:
     """Return a shallow copy whose key changes do not affect the context dictionary."""
     return dict(_context_fields_var.get() or {})
+
+
+@contextmanager
+def log_context(*, trace_id: str | None = None, **fields: Any) -> Iterator[None]:
+    """Temporarily bind a trace ID and structured fields to this execution context.
+
+    Nested scopes restore previous values even on exceptions and cancellation.
+    The synchronous context manager also works in ``async def`` using ``with``;
+    ContextVar state is copied into new asyncio tasks but not ordinary threads.
+    A ``None`` trace_id leaves the previous trace unchanged.
+    """
+    trace_token = set_trace_id(trace_id) if trace_id is not None else None
+    try:
+        fields_token = bind_log_context(**fields)
+        try:
+            yield
+        finally:
+            reset_log_context(fields_token)
+    finally:
+        if trace_token is not None:
+            reset_trace_id(trace_token)

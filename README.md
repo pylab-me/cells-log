@@ -1,311 +1,212 @@
 # cells-log
 
-`cells-log` is a lightweight structured logging kernel for Python services, CLIs, async workers and data pipelines.
+## 1. Introduction
 
-It keeps Python's stdlib `logging` ecosystem underneath, but exposes a small bound-logger API with bootstrap-safe initialization, structured fields, `ContextVar`-based trace context, file routing and optional queue-based writing.
+**cells-log** is a lightweight, structured logging library for Python services, command-line applications, async workers, and data pipelines. It builds on Python's standard `logging` module while offering structured fields, request-scoped context, configurable text/JSON output, rotating files, and optional bounded queue delivery.
 
-The import package path is `cells.log`.
+- **Python:** 3.10+; no mandatory runtime third-party dependencies.
+- **Import:** `cells.log`.
+- **Defaults:** JSON to stderr, synchronous delivery, no log files, and no takeover of the root logger.
+- **Ownership:** application code emits events; cells-log manages formatting and delivery. Existing third-party loggers can be captured explicitly.
 
-## Why this package exists
+The library favors predictable behavior: configuration can be replaced, queued records can be drained, and field-processing failures do not fall back to exposing unprocessed fields.
 
-Most projects start with `logging.basicConfig()` and eventually grow a mixed set of console logs, JSON logs, module files, request IDs and ad-hoc wrappers. `cells-log` is designed to keep that layer small and stable:
+## 2. DFD — Data Flow Diagram
 
-- Application code uses one bound logger API.
-- Infrastructure code controls sinks, formatters and lifecycle.
-- Project-specific policy, such as field serialization or redaction, is injected through hooks instead of hard-coded into the kernel.
-- Bootstrap logs work before full application settings are available.
+```mermaid
+flowchart TD
+    A[Application code] --> B[BoundLogger: message + fields]
+    X[Third-party stdlib logging] --> C[Managed stdlib Logger]
+    B --> C
+    V[ContextVar: trace ID + request fields] --> D[Context snapshot]
+    C --> E[SwitchingHandler]
+    E --> D
+    D --> F{Queue enabled?}
+    F -->|No| H[Formatter + field processor]
+    F -->|Yes| G[Bounded queue + listener]
+    G --> H
+    F -.->|Queue full: policy-driven drop / block / sync fallback| J[Backpressure handling]
+    J -.->|Sync fallback| H
+    H --> K[Console: text / JSON]
+    H --> L[Aggregate file: text / JSON]
+    H --> M[Module files: text / JSON]
+```
 
-## Installation
+The context snapshot is taken on the producing thread before queue submission. The field processor and renderer run when a sink formats a record; the processor runs at most once **per record**, including when multiple sinks are enabled. A queue provides asynchronous **in-process** delivery, not durable storage. Sink failures and queue loss are observable but cannot be retroactively recovered.
 
-From source:
+## 3. Quick start
+
+Install from the repository:
 
 ```bash
 python -m pip install -e .
 ```
 
-From a built wheel:
-
-```bash
-python -m pip install dist/cells_log-*.whl
-```
-
-## Quick start
+Configure once during application startup, then obtain loggers by stable module name:
 
 ```python
 from pathlib import Path
 
-from cells.log import (
-    LogConfig,
-    configure_logging,
-    get_logger,
-    reset_trace_id,
-    set_trace_id,
-    shutdown_logging,
-)
-
+from cells.log import LogConfig, configure_logging, get_logger, log_context, shutdown_logging
 
 configure_logging(
     LogConfig(
-        app_name="app",
+        app_name="checkout",
         level="INFO",
         format="json",
+        format_for_console="text",
+        format_for_file="json",
         log_dir=Path("./logs"),
-        enable_console=True,
-        enable_module_file=True,
         enable_total_file=True,
-        total_file="app.log",
-        module_name_prefixes=("app",),
-    )
+    ),
+    strict=True,
 )
 
-trace_token = set_trace_id("trace-001")
 try:
-    log = get_logger("app.worker").bind(stage="worker")
-    log.info("task completed", task_id="t1", duration_ms=12.3)
+    log = get_logger("checkout.payment").bind(component="payments")
+    with log_context(trace_id="trace-123", request_id="req-42"):
+        log.info("payment.authorized", order_id="o-17", amount=199.0)
+        try:
+            raise RuntimeError("gateway unavailable")
+        except RuntimeError:
+            log.exception("payment.failed", order_id="o-17")
 finally:
-    reset_trace_id(trace_token)
     shutdown_logging()
 ```
 
-Example JSON line:
+Console output uses readable text; `./logs/checkout.log` receives structured JSON lines. `format_for_console` and `format_for_file` inherit `format` when set to `None`. File output is opt-in and requires `log_dir`.
 
-```json
-{"timestamp":"2026-05-11T00:00:00+00:00","level":"INFO","logger":"app.worker","message":"task completed","trace_id":"trace-001","path":"/app/worker.py:42","func":"run","fields":{"channel":"app.worker","log_tag":"app_worker","stage":"worker","task_id":"t1","duration_ms":12.3}}
-```
-
-## Public API
+For existing framework loggers, opt into exact-name capture rather than automatically taking over the root logger:
 
 ```python
-from cells.log import (
-    LogConfig,
-    bootstrap_logging,
-    configure_logging,
-    configure_logging_from_env,
-    get_logger,
-    get_queue_stats,
-    set_trace_id,
-    reset_trace_id,
-    bind_log_context,
-    reset_log_context,
-    shutdown_logging,
-)
+LogConfig(capture_loggers=("uvicorn.error", "sqlalchemy.engine"))
 ```
 
-### `bootstrap_logging()`
+Captured logger handlers are temporarily replaced and restored on shutdown. Do not simultaneously capture a logger name owned by `get_logger()`.
 
-Initializes console-only logging from environment variables. This is safe before application settings are loaded. File sinks and queue writing stay disabled during bootstrap, even when their environment flags are enabled.
+## 4. Public API
 
-```python
-from cells.log import bootstrap_logging, get_logger
-
-
-bootstrap_logging(app_name="demo")
-get_logger("demo.boot").info("bootstrap started")
-```
-
-### `configure_logging()`
-
-Configures the production handler graph from an explicit `LogConfig`.
-
-```python
-from cells.log import LogConfig, configure_logging
-
-
-configure_logging(LogConfig(app_name="demo", level="DEBUG", format="text"))
-```
-
-Reconfiguration prepares the replacement while the current configuration continues serving logs. Preparation failure leaves the current configuration active. Handover briefly gates delivery to drain accepted queue records and transfer file streams; activation failure restores the previous configuration. After a successful switch, old resources are cleaned up while the replacement serves logs.
-
-Use `force=False` to keep an existing production configuration. Call `shutdown_logging()` before process exit to drain queued records and close managed handlers.
-
-### `configure_logging_from_env()`
-
-Builds `LogConfig` from environment variables.
-
-```python
-from pathlib import Path
-from cells.log import configure_logging_from_env
-
-
-configure_logging_from_env(
-    app_name="demo",
-    default_log_dir=Path("./logs"),
-    env_prefix="CELLS_LOG",
-)
-```
-
-## Environment variables
-
-When using `configure_logging_from_env(env_prefix="CELLS_LOG")`, supported variables include:
-
-| Variable | Meaning |
+| API | Purpose |
 |---|---|
-| `CELLS_LOG_LEVEL` | `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
-| `CELLS_LOG_FORMAT` | `json` or `text` |
-| `CELLS_LOG_DIR` | Log directory used by file sinks |
-| `CELLS_LOG_FILE` | Total log file path or file name |
-| `CELLS_LOG_ENABLE_CONSOLE` | Enable console sink |
-| `CELLS_LOG_ENABLE_MODULE_FILE` | Enable per-module file sink |
-| `CELLS_LOG_ENABLE_TOTAL_FILE` | Enable total file sink |
-| `CELLS_LOG_ROTATION` | `daily` or `size` |
-| `CELLS_LOG_RETENTION` | Number of rotated files to keep |
-| `CELLS_LOG_SIZE_LIMIT` | Size rotation limit, for example `100MB` |
-| `CELLS_LOG_USE_QUEUE` | Enable in-process `QueueHandler` / `QueueListener` |
-| `CELLS_LOG_QUEUE_CAPACITY` | Maximum number of buffered log records |
-| `CELLS_LOG_QUEUE_FULL_POLICY` | `drop`, `block`, or `sync_fallback` |
-| `CELLS_LOG_CAPTURE_WARNINGS` | Route Python warnings into logging |
-| `CELLS_LOG_MANAGE_ROOT_LOGGER` | Route root logger records through cells-log |
+| `LogConfig(...)` | Configure sinks, formats, rotation, queueing, and optional integrations. |
+| `configure_logging(config, force=True, strict=False)` | Activate or replace logging; use `strict=True` to reject invalid explicit configuration. |
+| `bootstrap_logging(app_name="app", env_prefix="CELLS_LOG")` | Early startup console-only logging (files and queue disabled). |
+| `config_from_env(...)` | Build a `LogConfig` without activating it. |
+| `configure_logging_from_env(...)` | Build and activate environment-driven configuration. |
+| `get_logger(name=None)` | Obtain a `BoundLogger`; use module names, not dynamic user/request IDs. |
+| `log.bind(**fields)` | Return a new logger with persistent fields; does not mutate the original. |
+| `log.trace/debug/info/success/warning/error/fail/critical(message, **fields)` | Emit a message with named structured fields. `success` = INFO; `fail` = ERROR. |
+| `log.exception(message, **fields)` | Emit ERROR with the current exception traceback (normally inside `except`). |
+| `log.is_enabled_for(level)` | Check whether a severity is enabled. |
+| `log.timings(event, metrics=(), **fields)` | Collect stage durations and emit a single summary. |
+| `log_context(trace_id=None, **fields)` | Scoped trace ID and fields, automatically restored on exit. |
+| `set_trace_id` / `reset_trace_id` | Low-level trace-context token management. |
+| `bind_log_context` / `reset_log_context` | Low-level field-context token management. |
+| `get_trace_id()` / `get_log_context()` | Read current context. |
+| `flush_logging(timeout=None)` | Drain accepted queued records and flush active sinks; returns `bool`. |
+| `get_queue_stats()` | Read queue acceptance, drops, fallback, errors, and latency counters. |
+| `shutdown_logging()` | Drain, close sinks, and restore managed external logger state. |
 
-## Configuration model
+`BoundLogger` methods accept **`message, **fields`**, not the standard `logging` positional interpolation pattern (`log.info("x=%s", x)`). For standard logging integration, existing `logging.getLogger(...)` calls continue using stdlib conventions.
 
-`LogConfig` controls console and file sinks, rotation, queue backpressure, root/warnings capture, the fallback trace ID and serialization hooks. See [`cells/log/config.py`](cells/log/config.py) for all fields and defaults.
+Other exported names include `TimingCollector`, `LogStage`, `TRACE_LEVEL_NUM`, `parse_log_level`, `FieldProcessor`, and `JsonDumps`; ordinary application code rarely needs to import them directly.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full design boundary.
+## 5. Environment variables
 
-### Queue backpressure
+Use `configure_logging_from_env(env_prefix="CELLS_LOG")`. Replace `CELLS_LOG` with your chosen prefix if needed. Explicit `app_name` takes precedence over `base.app_name`; environment values override supported fields in the base configuration.
 
-In **v0.3.0** the default is **synchronous delivery** (`use_queue=False`): for fast stdout or local file sinks a background listener may add CPU overhead instead of improving throughput. Opt into `use_queue=True` when application threads must avoid a **slow** file/network sink and can tolerate buffered delivery. The in-process queue is bounded (default capacity: 10,000 records). Choose `queue_full_policy` according to latency and loss requirements:
-
-| Policy | Behavior when the queue is full |
+| Variable | Value / effect |
 |---|---|
-| `drop` (default) | Discard the record and increment `dropped_records` |
-| `block` | Wait up to `queue_block_timeout` seconds, then discard and count the record |
-| `sync_fallback` | Write the record synchronously on the calling thread |
+| `CELLS_LOG_LEVEL` | Severity: `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `CELLS_LOG_FORMAT` | Default format: `json` or `text`. |
+| `CELLS_LOG_FORMAT_FOR_CONSOLE` | Console override: `json` or `text`. |
+| `CELLS_LOG_FORMAT_FOR_FILE` | File override: `json` or `text`. |
+| `CELLS_LOG_DIR` | Directory for file sinks. |
+| `CELLS_LOG_FILE` | Aggregate file name/path. |
+| `CELLS_LOG_ENABLE_CONSOLE` | Enable or disable console sink. |
+| `CELLS_LOG_ENABLE_MODULE_FILE` | Enable per-module rotating files. |
+| `CELLS_LOG_ENABLE_TOTAL_FILE` | Enable aggregate rotating file. |
+| `CELLS_LOG_ROTATION` | `daily` or `size`. |
+| `CELLS_LOG_RETENTION` | Number of rotated backups (integer). |
+| `CELLS_LOG_SIZE_LIMIT` | Per-file limit, e.g. `100MB`. |
+| `CELLS_LOG_USE_QUEUE` | Use bounded in-process queue (default: `false`). |
+| `CELLS_LOG_QUEUE_CAPACITY` | Queue capacity (default: `10000`). |
+| `CELLS_LOG_QUEUE_FULL_POLICY` | `drop`, `block`, or `sync_fallback`. |
+| `CELLS_LOG_QUEUE_FALLBACK_MIN_LEVEL` | Optional priority threshold, e.g. `ERROR`. |
+| `CELLS_LOG_CAPTURE_LOGGERS` | Comma-separated **exact** third-party logger names. |
+| `CELLS_LOG_CAPTURE_WARNINGS` | Capture Python warnings. |
+| `CELLS_LOG_MANAGE_ROOT_LOGGER` | Opt into root logger takeover. |
 
-`get_queue_stats()` returns `enabled`, `capacity`, `depth`, `dropped_records`, `accepted_records`, `delivered_records`, `fallback_records`, `delivery_errors`, `max_depth_sampled`, `mean_delivery_latency_ms`, and `max_delivery_latency_ms` for the active queue. The queue counters reset when the queue is replaced. `delivered_records` means listener dispatch completed without a *detected* built-in sink error, **not** that bytes reached durable storage. `delivery_errors` includes detected failures swallowed by built-in console/rotating-file handlers or the module-file router, as well as exceptions escaping sink dispatch; custom handlers that suppress errors remain invisible. Successful writes to one sink cannot cancel a detected failure in another. Queue metrics do not cover synchronous delivery. `max_depth_sampled` checks one event in 32, not the exact queue peak. `sync_fallback` delivery is reported separately and may reorder events.
+Boolean values accept `1/true/yes/y/on` and `0/false/no/n/off` (case-insensitive). Invalid environment booleans and integers generate warnings and keep their fallback values. `strict=True` validates an explicit `LogConfig`; it does not turn the environment parser into a strict parser. Other options, including `field_processor`, `json_dumps`, `queue_block_timeout`, and `module_name_prefixes`, are configured in Python.
 
-**Workload selection:** sync mode is the default for CLI, standard container stdout, and ordinary local files. Queue mode is opt-in for potentially blocking sinks and for latency-sensitive producer threads; benchmark both modes on the target deployment. The included benchmark tool compares sync/queue with discard, rotating file, and dual sinks: `python benchmarks/logging_benchmark.py --count 10000 --repeats 5`. Full results and profiling commands are in [`benchmarks/README.md`](benchmarks/README.md).
-
-## Context propagation
-
-`trace_id` and log context are stored in `ContextVar`, so they work naturally in async pipelines and request-scoped code.
-
-```python
-from cells.log import bind_log_context, reset_log_context, set_trace_id, reset_trace_id
-
-
-trace_token = set_trace_id("request-001")
-ctx_token = bind_log_context(request_id="request-001", user_id="u1")
-
-try:
-    ...
-finally:
-    reset_log_context(ctx_token)
-    reset_trace_id(trace_token)
-```
-
-## Hook model
-
-`cells-log` intentionally does not hard-code business policy. Field serialization, redaction, pruning and normalization should be attached through hooks.
+## 6. Flush barrier
 
 ```python
-from cells.log import LogConfig, configure_logging
+from cells.log import flush_logging, get_queue_stats
 
+if not flush_logging(timeout=3.0):
+    raise TimeoutError("Logging did not drain before the deadline")
 
-def field_processor(fields: dict) -> dict:
-    fields = dict(fields)
-    if "authorization" in fields:
-        fields["authorization"] = "***"
-    return fields
-
-
-configure_logging(LogConfig(field_processor=field_processor))
+stats = get_queue_stats()
+print(stats["dropped_records"], stats["delivery_errors"])
 ```
 
-**Security:** Field processors receive a shallow copy of merged business fields and run at most once per record, even with multiple sinks. If the processor raises or returns an invalid mapping, the complete input field dictionary is discarded and only a sanitized `_field_processor_error` type is emitted. Do not embed secrets in the free-form message or exception text: those are **not** processed by this hook.
+`flush_logging()` holds a logging handover barrier, waits for previously accepted queue work to finish, and invokes `flush()` on console and all active file streams. It also works in synchronous mode.
 
-Standard `logging.getLogger("library").warning("event", extra={"duration_ms": 123})` fields are emitted as JSON fields when `manage_root_logger=True`, without accidentally emitting reserved `LogRecord` internals.
+- Returns `True` when the in-process barrier completes; `False` on lock-acquisition or queue-drain timeout.
+- `timeout=None` waits without a deadline. A timeout **does not bound** an individual sink's own blocking `flush()`.
+- A successful return **does not** mean `fsync`, crash-safe persistence, remote delivery, or recovery of previously dropped records.
+- It is a blocking call: do not invoke it from the queue listener, a logging sink, or a latency-sensitive event loop.
 
-Custom JSON serializer:
+Queue admission uses `drop` by default when full. With `block`, the producer waits up to `queue_block_timeout`; `sync_fallback` writes on the producer thread. `queue_fallback_min_level="ERROR"` can opt higher-severity events into synchronous fallback when full, at the cost of possible blocking and out-of-order delivery. `get_queue_stats()` reports accepted, dropped, fallback and dispatch outcomes; counters reset on reconfiguration and are **not** a durable-delivery acknowledgment.
+
+## 7. Context propagation
+
+`ContextVar` keeps request/task fields separate across asyncio tasks. Prefer a scope around a **request or job**, not around every log call:
+
+```python
+from cells.log import get_logger, log_context
+
+log = get_logger(__name__)
+
+async def process_request(request_id: str) -> None:
+    with log_context(trace_id="trace-abc", request_id=request_id):
+        log.info("request.started")
+        await perform_work()
+        log.info("request.completed")
+```
+
+Nested `log_context()` scopes override fields temporarily and restore them on exit, including when an exception is raised. A synchronous `with` works inside `async def`; no separate async context manager is necessary.
+
+Field precedence is **context < standard-logging `extra` < logger `bind()` < call-site fields** (later values win). `trace_id` is a separate top-level attribute. For low-level integrations, use `set_trace_id()` / `reset_trace_id()` and `bind_log_context()` / `reset_log_context()` tokens in `try/finally`.
+
+Asyncio task creation inherits a snapshot of the current context; ordinary new threads do **not** automatically inherit it. Explicitly propagate context when using thread pools or custom thread workers. A queued log record captures its context before leaving the producer thread, but nested mutable field objects are shallow-copied, not frozen.
+
+## 8. Hook model
+
+The kernel does not hard-code application-specific serialization or redaction. Configure two optional hooks on `LogConfig`:
+
+| Hook | Contract | Use cases |
+|---|---|---|
+| `field_processor(fields)` | Receives a shallow copy of merged fields; returns a mapping. Invoked at most once per record across sinks. | Redaction, renaming, normalization, pruning. |
+| `json_dumps(obj, **kwargs)` | Returns a JSON `str`; called with `ensure_ascii=False` and retried without that keyword on `TypeError`. | Application-specific encoding of custom data types. |
 
 ```python
 import json
 from cells.log import LogConfig, configure_logging
 
 
-configure_logging(LogConfig(json_dumps=json.dumps))
+def redact(fields: dict) -> dict:
+    fields = dict(fields)
+    if "authorization" in fields:
+        fields["authorization"] = "[REDACTED]"
+    return fields
+
+
+configure_logging(
+    LogConfig(field_processor=redact, json_dumps=json.dumps),
+    strict=True,
+)
 ```
 
-## Fork and multi-worker deployment
-
-When a parent has already initialized logging and forks, cells-log detaches inherited queue listeners and sinks in the child. The child intentionally **does not log through the inherited graph**; configure an independent `LogConfig` inside each worker before emitting logs. This avoids waiting forever on a parent-only listener. If `manage_root_logger` is enabled, the child should likewise configure it for its own worker lifecycle.
-
-**Do not point multiple processes at the same rotating log file.** Standard rotating handlers are process-local. For Gunicorn/multiprocessing-style deployments, prefer per-worker JSON stdout collected by the deployment runtime or give each worker distinct file paths. Fork reinitialization does not turn local files into multi-process-safe sinks.
-
-Logger names acquired through `get_logger()` temporarily replace their stdlib handlers/level; original states are restored by `shutdown_logging()`. Root/warnings capture remains opt-in.
-
-## File layout
-
-With module and total logs enabled:
-
-```text
-logs/
-  app.log
-  modules/
-    app.log
-    app_worker.log
-    external.log
-    overflow.log
-```
-
-Routing notes:
-
-- `module_name_prefixes=("app",)` keeps application logs in their own module files.
-- Loggers outside the allowed prefix are routed into `external.log`.
-- If too many dynamic logger names are created, excess records are routed into `overflow.log` instead of opening unlimited file descriptors.
-- Names that map to the same file share a rotating handler, including case variants on Windows; each record retains its original logger name. v0.3.1 caches up to `max_module_handlers` hot names to avoid repeated filename/path calculations; arbitrary dynamic names cannot grow that cache without bound.
-
-## GitHub Actions
-
-This repository includes two workflows:
-
-- `.github/workflows/build.yml`: Python 3.11–3.14 tests on Linux and Windows, wheel artifact build, and GitHub Release publishing.
-- `.github/workflows/publish-pypi.yml`: release/manual wheel build, metadata check and PyPI publish.
-
-After tests and wheel metadata checks pass, `build.yml` publishes the built wheel according to the triggering ref:
-
-| Trigger | GitHub Release |
-|---|---|
-| Push to `main` | Update the `rolling` tag to the tested commit and publish a prerelease titled `rolling` |
-| Push a `v*` tag | Publish a release using the tag as its title |
-| Other pushes, pull requests, manual builds | Build and upload workflow artifacts only |
-
-The rolling release replaces matching wheel assets and removes wheel assets from older versions. It is not marked as the latest stable release. Publishing uses the built-in `GITHUB_TOKEN` with `contents: write` permission limited to the release job.
-
-Releases created with `GITHUB_TOKEN` do not trigger the separate PyPI workflow; use its manual trigger for those builds. See [GitHub's workflow triggering documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
-
-Expected repository secret:
-
-```text
-PYPI_API_TOKEN
-```
-
-Optional R2/S3 artifact variables used by `build.yml` on `v*` tags:
-
-```text
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-S3_BUCKET
-S3_ENDPOINT
-S3_PREFIX
-S3_REGION
-```
-
-## Development
-
-```bash
-python -m pip install -e . pytest
-python -m pytest -v
-```
-
-Build wheel locally:
-
-```bash
-python -m pip install build twine
-python -m build --wheel
-python -m twine check dist/*.whl
-```
-
-## Design status
-
-`cells-log` is intentionally small. The current package aims to cover the common 90% production logging cases without becoming a full observability platform. For OpenTelemetry, sampling, rate limiting, or redaction, prefer integration modules and hooks over changing the core logger API.
+**Security guarantees and limits:** if `field_processor` raises or returns an invalid mapping, cells-log discards the original field dictionary and emits only a sanitized `_field_processor_error` type marker. This is **fail-closed for structured fields**, not a general secret scanner: free-form messages and exception text are not redacted by the field hook. Hooks run during formatting (on the listener thread in queue mode), so sensitive fields can exist in memory inside queued records before redaction. Avoid logging secrets in messages, exceptions, or mutable objects, and do not treat the queue as a security boundary.

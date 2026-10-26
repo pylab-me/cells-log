@@ -123,6 +123,7 @@ class LogManager:
         self._logger_cache: dict[str, logging.Logger] = {}
         self._owned_logger_states: dict[str, _LoggerState] = {}
         self._config = LogConfig().normalized()
+        self._captured_logger_states: dict[str, _LoggerState] = {}
         self._root_state: _LoggerState | None = None
         self._warnings_state: _LoggerState | None = None
         self._warnings_capture_was_enabled = False
@@ -139,6 +140,11 @@ class LogManager:
         parent's background listener is absent and rotated files are not
         cross-process safe. Logging is intentionally muted until reconfigure.
         """
+        # Restore external logger ownership before the child starts any work.
+        # Otherwise a child may pin an inherited muted switching handler.
+        for state in self._captured_logger_states.values():
+            state.restore()
+        self._captured_logger_states.clear()
         self._lifecycle_lock = RLock()
         self._lock = RLock()
         self._switching_handler.createLock()
@@ -149,6 +155,7 @@ class LogManager:
         self._queue_listener = None
         self._retired_graphs = []
         self._stage = LogStage.SHUTDOWN
+        self._captured_logger_states.clear()
 
     @property
     def stage(self) -> LogStage:
@@ -175,7 +182,7 @@ class LogManager:
             )
             self._replace_handlers(config, stage=LogStage.BOOTSTRAP)
 
-    def configure(self, config: LogConfig, *, force: bool = True) -> None:
+    def configure(self, config: LogConfig, *, force: bool = True, strict: bool = False) -> None:
         """Prepare and activate a config, then retire old resources.
 
         Preparation failure preserves the old config. force=False returns
@@ -187,6 +194,7 @@ class LogManager:
         Args:
             config: Console, file, queue and integration settings to activate.
             force: Replace an existing production config when True.
+            strict: Reject invalid configuration rather than applying legacy fallbacks.
 
         Raises:
             ValueError: File logging is enabled without log_dir.
@@ -196,7 +204,15 @@ class LogManager:
             if self._stage == LogStage.PRODUCTION and not force:
                 return
 
+            if strict:
+                config.validate()
             config = config.normalized()
+            owned_overlap = set(config.capture_loggers).intersection(self._logger_cache)
+            if owned_overlap:
+                raise ValueError(
+                    "capture_loggers conflicts with get_logger ownership: "
+                    + ", ".join(sorted(owned_overlap))
+                )
             if (config.enable_module_file or config.enable_total_file) and config.log_dir is None:
                 raise ValueError("config.log_dir is required when file logging is enabled")
 
@@ -208,7 +224,7 @@ class LogManager:
     def configure_from_env(
         self,
         *,
-        app_name: str = "app",
+        app_name: str | None = None,
         default_log_dir: Path | str | None = None,
         env_prefix: str = "CELLS_LOG",
         base: LogConfig | None = None,
@@ -227,6 +243,10 @@ class LogManager:
         """Cache the underlying logger and return a new wrapper with channel/log_tag fields."""
         with self._lock:
             logger_name = name or self._config.app_name
+            if logger_name in self._captured_logger_states:
+                raise ValueError(
+                    f"get_logger({logger_name!r}) conflicts with capture_loggers ownership"
+                )
             raw_logger = self._logger_cache.get(logger_name)
             if raw_logger is None:
                 raw_logger = logging.getLogger(logger_name)
@@ -363,16 +383,13 @@ class LogManager:
 
         console_formatter: logging.Formatter
         file_formatter: logging.Formatter
-        if config.format == "json":
+        console_format = config.format_for_console or config.format
+        file_format = config.format_for_file or config.format
+        if console_format == "json":
             console_formatter = JsonLineFormatter(
                 config,
                 include_fields=config.console_include_fields,
                 include_exception=config.console_include_exception,
-            )
-            file_formatter = (
-                console_formatter
-                if config.console_include_fields and config.console_include_exception
-                else JsonLineFormatter(config, include_fields=True, include_exception=True)
             )
         else:
             console_formatter = ConsoleTextFormatter(
@@ -382,6 +399,15 @@ class LogManager:
                 simplify_console_errors=config.simplify_console_errors,
                 detail_sink_enabled=detail_sink_enabled,
             )
+        if file_format == "json":
+            file_formatter = (
+                console_formatter
+                if console_format == "json"
+                and config.console_include_fields
+                and config.console_include_exception
+                else JsonLineFormatter(config, include_fields=True, include_exception=True)
+            )
+        else:
             file_formatter = ConsoleTextFormatter(
                 config, include_fields=True, include_exception=True
             )
@@ -491,8 +517,15 @@ class LogManager:
         """Apply routing changes or restore the exact preceding logger state."""
         loggers = {logging.getLogger(), logging.getLogger("py.warnings")}
         loggers.update(self._logger_cache.values())
+        loggers.update(state.logger for state in self._captured_logger_states.values())
+        loggers.update(logging.getLogger(name) for name in candidate.config.capture_loggers)
         snapshots = [_LoggerState(logger) for logger in loggers]
-        ownership = self._root_state, self._warnings_state, self._warnings_capture_was_enabled
+        ownership = (
+            self._root_state,
+            self._warnings_state,
+            self._warnings_capture_was_enabled,
+            dict(self._captured_logger_states),
+        )
         showwarning = warnings.showwarning
         capture_enabled = getattr(logging, "_warnings_showwarning", None) is not None
         previous = self._current_graph()
@@ -512,7 +545,12 @@ class LogManager:
                 snapshot.restore()
             logging.captureWarnings(capture_enabled)
             warnings.showwarning = showwarning
-            self._root_state, self._warnings_state, self._warnings_capture_was_enabled = ownership
+            (
+                self._root_state,
+                self._warnings_state,
+                self._warnings_capture_was_enabled,
+                self._captured_logger_states,
+            ) = ownership
             set_default_trace_id(default_trace_id)
             raise
 
@@ -543,6 +581,18 @@ class LogManager:
             self._root_state.restore()
             self._root_state = None
 
+        requested = set(config.capture_loggers)
+        for name in set(self._captured_logger_states) - requested:
+            self._captured_logger_states.pop(name).restore()
+        for name in config.capture_loggers:
+            logger = logging.getLogger(name)
+            if name not in self._captured_logger_states:
+                self._captured_logger_states[name] = _LoggerState(logger)
+            logger.handlers[:] = [self._switching_handler]
+            logger.setLevel(level)
+            logger.propagate = False
+            logger.disabled = False
+
         if config.capture_warnings:
             warnings_logger = logging.getLogger("py.warnings")
             if self._warnings_state is None:
@@ -562,7 +612,10 @@ class LogManager:
             self._warnings_capture_was_enabled = False
 
     def _restore_external_loggers(self) -> None:
-        """Return root and warnings loggers to their pre-cells state."""
+        """Return root, selected names and warnings to their pre-cells state."""
+        for state in self._captured_logger_states.values():
+            state.restore()
+        self._captured_logger_states.clear()
         if self._warnings_state is not None:
             self._warnings_state.restore()
             logging.captureWarnings(self._warnings_capture_was_enabled)
@@ -627,19 +680,20 @@ def bootstrap_logging(*, app_name: str = "app", env_prefix: str = "CELLS_LOG") -
     _MANAGER.bootstrap(app_name=app_name, env_prefix=env_prefix)
 
 
-def configure_logging(config: LogConfig, *, force: bool = True) -> None:
+def configure_logging(config: LogConfig, *, force: bool = True, strict: bool = False) -> None:
     """Activate production config, retaining existing production config if force=False.
 
     Preparation failure preserves the old config; activation failure restores old
-    routes. Log calls may wait during handover commit. Configuring does not turn
-    the queue's drop policy into guaranteed delivery.
+    routes. Log calls may wait during handover commit. Use strict=True to reject
+    invalid configuration instead of applying legacy fallbacks. Configuring does
+    not turn the queue's drop policy into guaranteed delivery.
     """
-    _MANAGER.configure(config, force=force)
+    _MANAGER.configure(config, force=force, strict=strict)
 
 
 def configure_logging_from_env(
     *,
-    app_name: str = "app",
+    app_name: str | None = None,
     default_log_dir: Path | str | None = None,
     env_prefix: str = "CELLS_LOG",
     base: LogConfig | None = None,

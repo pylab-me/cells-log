@@ -4,6 +4,7 @@ from .config import FieldProcessor, JsonDumps, LogConfig, config_from_env
 from .context import (
     bind_log_context,
     get_log_context,
+    log_context,
     get_trace_id,
     reset_log_context,
     reset_trace_id,
@@ -37,6 +38,7 @@ __all__ = [
     "configure_logging",
     "configure_logging_from_env",
     "get_log_context",
+    "log_context",
     "get_logger",
     "flush_logging",
     "get_queue_stats",

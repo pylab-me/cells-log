@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json as std_json
 import os
+import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -57,8 +59,12 @@ class LogConfig:
     # "INFO" (default); WARN/FATAL aliases accepted. Unknown names warn and use INFO.
     level: str | int = "INFO"
     # Options: <"json", "text">. "json" (default) for single-line JSON;
-    # "text" for human-readable output. Applies to console and files.
+    # "text" for human-readable output. Default inherited by console and file
+    # unless format_for_console or format_for_file overrides it.
     format: LogFormat = "json"
+    # None inherits format. These names express what format is used for each sink.
+    format_for_console: LogFormat | None = None
+    format_for_file: LogFormat | None = None
     # Options: <Path, str, None>. None (default); required for any file output, even
     # with an absolute total_file. Expands ~; the manager creates the directory.
     log_dir: Path | str | None = None
@@ -135,6 +141,9 @@ class LogConfig:
     # Options: <True, False>. False (default) leaves root unmanaged; True captures records at root.
     # Records stopped upstream are excluded; disabling or shutdown restores prior handlers/state.
     manage_root_logger: bool = False
+    # Exact names only. Temporarily replace named logger handlers and restore at shutdown.
+    # Do not list "root" or "py.warnings" (the latter uses capture_warnings).
+    capture_loggers: tuple[str, ...] | list[str] = ()
     # Options: <True, False>. True (default) emits ISO timestamps with UTC timezone;
     # False emits local ISO timestamps without a timezone offset.
     timestamp_utc: bool = True
@@ -158,10 +167,17 @@ class LogConfig:
         TypeError/ValueError. Level, size and directory validation is delegated
         to the level parser, file handler and manager respectively.
         """
+        self._validate_capture_names()
         log_dir = Path(self.log_dir).expanduser() if self.log_dir is not None else None
         total_file = Path(self.total_file).expanduser() if self.total_file is not None else None
         rotation: RotationMode = "daily" if str(self.rotation).lower() == "daily" else "size"
         fmt: LogFormat = "text" if str(self.format).lower() == "text" else "json"
+        format_for_console = (
+            None if self.format_for_console is None else str(self.format_for_console).lower()
+        )
+        format_for_file = (
+            None if self.format_for_file is None else str(self.format_for_file).lower()
+        )
         queue_full_policy: QueueFullPolicy = (
             self.queue_full_policy
             if self.queue_full_policy in {"drop", "block", "sync_fallback"}
@@ -170,6 +186,21 @@ class LogConfig:
         normalized = replace(
             self,
             format=fmt,
+            capture_loggers=tuple(self.capture_loggers),
+            format_for_console=(
+                "text"
+                if format_for_console == "text"
+                else "json"
+                if format_for_console is not None
+                else None
+            ),
+            format_for_file=(
+                "text"
+                if format_for_file == "text"
+                else "json"
+                if format_for_file is not None
+                else None
+            ),
             log_dir=log_dir,
             total_file=total_file,
             rotation=rotation,
@@ -185,6 +216,18 @@ class LogConfig:
                 str(self.format).lower() in {"json", "text"},
                 "json, text",
                 "log output may not match the expected parser",
+            ),
+            (
+                "format_for_console",
+                format_for_console in {None, "json", "text"},
+                "json, text, or None (inherit)",
+                "the console output may not match the expected parser",
+            ),
+            (
+                "format_for_file",
+                format_for_file in {None, "json", "text"},
+                "json, text, or None (inherit)",
+                "the file output may not match the expected parser",
             ),
             (
                 "rotation",
@@ -231,12 +274,75 @@ class LogConfig:
                     allowed=allowed,
                     risk=risk,
                 )
+        normalized._validate_capture_names()
         return normalized
+
+    def _validate_capture_names(self) -> None:
+        """Reject ambiguous and unsafe external logger ownership."""
+        if not isinstance(self.capture_loggers, (tuple, list)) or any(
+            not isinstance(name, str) or not name.strip() or name != name.strip()
+            for name in self.capture_loggers
+        ):
+            raise ValueError("capture_loggers must be a sequence of nonempty logger names")
+        if len(set(self.capture_loggers)) != len(self.capture_loggers):
+            raise ValueError("capture_loggers must not contain duplicates")
+        if "root" in self.capture_loggers or "py.warnings" in self.capture_loggers:
+            raise ValueError("use manage_root_logger/capture_warnings for special loggers")
+
+    def validate(self) -> None:
+        """Validate configuration strictly without modifying it or emitting fallbacks.
+
+        Use before configure_logging(..., strict=True) when configuration
+        mistakes must raise rather than be normalized to possibly unsafe defaults.
+        """
+        for name in ("format", "format_for_console", "format_for_file"):
+            raw = getattr(self, name)
+            if (raw is None and name == "format") or (
+                raw is not None and str(raw).lower() not in {"json", "text"}
+            ):
+                raise ValueError(f"{name} must be 'json' or 'text'")
+        if str(self.rotation).lower() not in {"daily", "size"}:
+            raise ValueError("rotation must be 'daily' or 'size'")
+        if self.queue_full_policy not in {"drop", "block", "sync_fallback"}:
+            raise ValueError("queue_full_policy must be drop, block or sync_fallback")
+        for name, lower in (("retention", 0), ("max_module_handlers", 1), ("queue_capacity", 1)):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < lower:
+                raise ValueError(f"{name} must be an integer >= {lower}")
+        if (
+            isinstance(self.queue_block_timeout, bool)
+            or not isinstance(self.queue_block_timeout, (float, int))
+            or not 0 <= self.queue_block_timeout < float("inf")
+        ):
+            raise ValueError("queue_block_timeout must be finite and nonnegative")
+        for name in ("level", "queue_fallback_min_level"):
+            level = getattr(self, name)
+            if level is None:
+                if name == "level":
+                    raise ValueError("level must be a logging level")
+                continue
+            if isinstance(level, int) and not isinstance(level, bool):
+                continue
+            if not isinstance(level, str) or (
+                not isinstance(getattr(logging, level.strip().upper(), None), int)
+                and level.strip().upper() != "TRACE"
+            ):
+                raise ValueError(f"{name} is not a supported logging level: {level!r}")
+        if isinstance(self.size_limit, bool) or not (
+            isinstance(self.size_limit, int)
+            and self.size_limit >= 0
+            or isinstance(self.size_limit, str)
+            and re.fullmatch(r"\s*\d+\s*(?:B|KB|MB|GB)?\s*", self.size_limit, re.I) is not None
+        ):
+            raise ValueError("size_limit must be a nonnegative byte count or B/KB/MB/GB")
+        if (self.enable_module_file or self.enable_total_file) and self.log_dir is None:
+            raise ValueError("log_dir is required for file logging")
+        self._validate_capture_names()
 
 
 def config_from_env(
     *,
-    app_name: str = "app",
+    app_name: str | None = None,
     default_log_dir: Path | str | None = None,
     env_prefix: str = "CELLS_LOG",
     base: LogConfig | None = None,
@@ -244,7 +350,7 @@ def config_from_env(
     """Return normalized environment overrides on base without activating logging.
 
     Args:
-        app_name: Application name overriding base.app_name unless empty.
+        app_name: Explicit application name; omit to preserve base.app_name.
         default_log_dir: Directory fallback taking precedence over base.log_dir.
         env_prefix: Variable prefix; generated names are uppercased.
         base: Baseline config; fields without environment overrides are retained.
@@ -253,6 +359,7 @@ def config_from_env(
         A normalized copy with applicable environment overrides.
 
     Environment names use <PREFIX>_<NAME>. Supported names are LEVEL, FORMAT,
+    FORMAT_FOR_CONSOLE, FORMAT_FOR_FILE, CAPTURE_LOGGERS,
     DIR, FILE, ENABLE_CONSOLE, ENABLE_MODULE_FILE, ENABLE_TOTAL_FILE, ROTATION,
     RETENTION, SIZE_LIMIT, USE_QUEUE, QUEUE_CAPACITY, QUEUE_FULL_POLICY,
     QUEUE_FALLBACK_MIN_LEVEL,
@@ -262,7 +369,9 @@ def config_from_env(
     DIR/FILE retain path fallbacks. LEVEL is parsed by name, so numeric strings
     are not converted to numeric levels. Pass custom integers via LogConfig.level.
     """
-    cfg = base or LogConfig(app_name=app_name, log_dir=default_log_dir)
+    cfg = (
+        base if base is not None else LogConfig(app_name=app_name or "app", log_dir=default_log_dir)
+    )
 
     log_dir = env_path(
         env_key(env_prefix, "DIR"),
@@ -275,6 +384,12 @@ def config_from_env(
         app_name=app_name or cfg.app_name,
         level=os.getenv(env_key(env_prefix, "LEVEL"), str(cfg.level)),
         format=os.getenv(env_key(env_prefix, "FORMAT"), str(cfg.format)).lower(),  # type: ignore[arg-type]
+        format_for_console=(
+            os.getenv(env_key(env_prefix, "FORMAT_FOR_CONSOLE"), cfg.format_for_console) or None
+        ),  # type: ignore[arg-type]
+        format_for_file=(
+            os.getenv(env_key(env_prefix, "FORMAT_FOR_FILE"), cfg.format_for_file) or None
+        ),  # type: ignore[arg-type]
         log_dir=log_dir,
         total_file=total_file,
         enable_console=env_bool(env_key(env_prefix, "ENABLE_CONSOLE"), cfg.enable_console),
@@ -299,5 +414,13 @@ def config_from_env(
         manage_root_logger=env_bool(
             env_key(env_prefix, "MANAGE_ROOT_LOGGER"),
             cfg.manage_root_logger,
+        ),
+        capture_loggers=(
+            tuple(
+                name.strip()
+                for name in os.environ[env_key(env_prefix, "CAPTURE_LOGGERS")].split(",")
+            )
+            if os.environ.get(env_key(env_prefix, "CAPTURE_LOGGERS"), "").strip()
+            else cfg.capture_loggers
         ),
     ).normalized()
