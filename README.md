@@ -172,7 +172,7 @@ In **v0.3.0** the default is **synchronous delivery** (`use_queue=False`): for f
 | `block` | Wait up to `queue_block_timeout` seconds, then discard and count the record |
 | `sync_fallback` | Write the record synchronously on the calling thread |
 
-`get_queue_stats()` returns `enabled`, `capacity`, `depth`, `dropped_records`, `accepted_records`, `delivered_records`, `fallback_records`, `delivery_errors`, `max_depth_sampled`, `mean_delivery_latency_ms`, and `max_delivery_latency_ms` for the active queue. The queue counters reset when the queue is replaced. `delivered_records` means the listener invoked the sink handler(s), **not** that bytes reached durable storage. `delivery_errors` observes exceptions escaping sink handlers; errors swallowed by stdlib handlers are not visible. `max_depth_sampled` checks one event in 32, not the exact queue peak. `sync_fallback` delivery is reported separately and may reorder events.
+`get_queue_stats()` returns `enabled`, `capacity`, `depth`, `dropped_records`, `accepted_records`, `delivered_records`, `fallback_records`, `delivery_errors`, `max_depth_sampled`, `mean_delivery_latency_ms`, and `max_delivery_latency_ms` for the active queue. The queue counters reset when the queue is replaced. `delivered_records` means listener dispatch completed without a *detected* built-in sink error, **not** that bytes reached durable storage. `delivery_errors` includes detected failures swallowed by built-in console/rotating-file handlers or the module-file router, as well as exceptions escaping sink dispatch; custom handlers that suppress errors remain invisible. Successful writes to one sink cannot cancel a detected failure in another. Queue metrics do not cover synchronous delivery. `max_depth_sampled` checks one event in 32, not the exact queue peak. `sync_fallback` delivery is reported separately and may reorder events.
 
 **Workload selection:** sync mode is the default for CLI, standard container stdout, and ordinary local files. Queue mode is opt-in for potentially blocking sinks and for latency-sensitive producer threads; benchmark both modes on the target deployment. The included benchmark tool compares sync/queue with discard, rotating file, and dual sinks: `python benchmarks/logging_benchmark.py --count 10000 --repeats 5`. Full results and profiling commands are in [`benchmarks/README.md`](benchmarks/README.md).
 
@@ -244,16 +244,16 @@ logs/
   modules/
     app.log
     app_worker.log
-    _external.log
-    _overflow.log
+    external.log
+    overflow.log
 ```
 
 Routing notes:
 
 - `module_name_prefixes=("app",)` keeps application logs in their own module files.
-- Loggers outside the allowed prefix are routed into `_external.log`.
-- If too many dynamic logger names are created, excess records are routed into `_overflow.log` instead of opening unlimited file descriptors.
-- Names that map to the same file share a rotating handler, including case variants on Windows; each record retains its original logger name.
+- Loggers outside the allowed prefix are routed into `external.log`.
+- If too many dynamic logger names are created, excess records are routed into `overflow.log` instead of opening unlimited file descriptors.
+- Names that map to the same file share a rotating handler, including case variants on Windows; each record retains its original logger name. v0.3.1 caches up to `max_module_handlers` hot names to avoid repeated filename/path calculations; arbitrary dynamic names cannot grow that cache without bound.
 
 ## GitHub Actions
 

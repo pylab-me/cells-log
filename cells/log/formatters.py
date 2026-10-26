@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cells.log.config import LogConfig
+from cells.log.context import get_log_context, get_trace_id
 
 
 _COLORS = {
@@ -26,8 +27,6 @@ class ContextFilter(logging.Filter):
     """Inject trace_id and context fields into LogRecord."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        from .context import get_log_context, get_trace_id
-
         # Queue-based logging runs final handlers in a listener thread. Preserve
         # context values injected by the producer-side QueueHandler instead of
         # overwriting them with the listener thread's empty context.

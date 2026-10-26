@@ -22,6 +22,7 @@ from cells.log.handlers import (
     ModuleFileRouterHandler,
     SafeQueueListener,
     SwitchingHandler,
+    _TrackedStreamHandler,
     create_rotating_file_handler,
     make_log_queue,
     open_file_streams,
@@ -267,9 +268,10 @@ class LogManager:
     def get_queue_stats(self) -> dict[str, int | bool | float]:
         """Snapshot queue delivery metrics (reset whenever configured again).
 
-        Delivered means listener dispatch returned, not guaranteed durable write.
-        ``max_depth_sampled`` is sampled, not a strict peak.  Sink handlers that
-        swallow their own I/O errors may be invisible to ``delivery_errors``.
+        Delivered means no detected built-in sink error during listener dispatch,
+        not guaranteed durable write. ``max_depth_sampled`` is sampled, not a
+        strict peak. Custom handlers that suppress their own failures cannot be
+        accounted for without their own reporting contract.
         """
         with self._lock:
             if self._queue_handler is None:
@@ -325,7 +327,7 @@ class LogManager:
 
         if config.enable_console:
             stream = sys.stderr if config.console_to_stderr else sys.stdout
-            console_handler = logging.StreamHandler(stream)
+            console_handler = _TrackedStreamHandler(stream)
             handlers.append(console_handler)
             console_handler.setLevel(level)
             console_handler.setFormatter(console_formatter)

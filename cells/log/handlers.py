@@ -25,6 +25,30 @@ from cells.log.formatters import ContextFilter
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+class _SinkErrorTracking:
+    """Mark failed sink dispatch even when stdlib handleError swallows an I/O error.
+
+    This does not prove durable persistence, and custom handlers still require
+    their own reporting contract.  The marker travels with one LogRecord only.
+    """
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        record._cells_sink_error = True
+        super().handleError(record)
+
+
+class _TrackedStreamHandler(_SinkErrorTracking, logging.StreamHandler):
+    """Observe errors from cells-log's built-in console sink."""
+
+
+class _TrackedRotatingFileHandler(_SinkErrorTracking, RotatingFileHandler):
+    """Observe errors from cells-log's built-in size-rotating sink."""
+
+
+class _TrackedTimedRotatingFileHandler(_SinkErrorTracking, TimedRotatingFileHandler):
+    """Observe errors from cells-log's built-in daily-rotating sink."""
+
+
 class SwitchingHandler(logging.Handler):
     """Keep a stable logging entrypoint while the managed sinks change."""
 
@@ -206,7 +230,9 @@ class MetricsQueueListener(SafeQueueListener):
             # Keep accepting future events rather than killing the listener.
             self._metrics.handleError(record)
         else:
-            self._metrics.delivery_finished(record, failed=False)
+            self._metrics.delivery_finished(
+                record, failed=bool(getattr(record, "_cells_sink_error", False))
+            )
 
 
 class ModuleFileRouterHandler(logging.Handler):
@@ -233,6 +259,9 @@ class ModuleFileRouterHandler(logging.Handler):
         self._formatter = formatter
         self._level = level
         self._handlers: dict[Path, logging.Handler] = {}
+        # Cache common names, not unbounded tenant/request-derived names.
+        # The path-indexed cache remains authoritative for aliases and rollover.
+        self._name_cache: dict[str, logging.Handler] = {}
         self._lock = RLock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -242,6 +271,8 @@ class ModuleFileRouterHandler(logging.Handler):
             handler = self._get_or_create_handler(module_name)
             handler.emit(record)
         except Exception:
+            # Module router errors are swallowed through logging.handleError.
+            record._cells_sink_error = True
             self.handleError(record)
 
     def close(self) -> None:
@@ -251,6 +282,7 @@ class ModuleFileRouterHandler(logging.Handler):
                 with suppress(Exception):
                     handler.close()
             self._handlers.clear()
+            self._name_cache.clear()
         super().close()
 
     def release_file_streams(self) -> None:
@@ -266,21 +298,25 @@ class ModuleFileRouterHandler(logging.Handler):
 
     def _get_or_create_handler(self, module_name: str) -> logging.Handler:
         with self._lock:
+            cached = self._name_cache.get(module_name)
+            if cached is not None:
+                return cached
+
             log_path = self._module_path(module_name)
             handler = self._handlers.get(log_path)
-            if handler is not None:
-                return handler
+            if handler is None:
+                if len(self._handlers) >= self._config.max_module_handlers:
+                    log_path = self._module_path("_overflow")
+                    handler = self._handlers.get(log_path)
 
-            if len(self._handlers) >= self._config.max_module_handlers:
-                log_path = self._module_path("_overflow")
-                handler = self._handlers.get(log_path)
-                if handler is not None:
-                    return handler
+                if handler is None:
+                    handler = create_rotating_file_handler(
+                        log_path, self._config, self._formatter, self._level
+                    )
+                    self._handlers[log_path] = handler
 
-            handler = create_rotating_file_handler(
-                log_path, self._config, self._formatter, self._level
-            )
-            self._handlers[log_path] = handler
+            if len(self._name_cache) < self._config.max_module_handlers:
+                self._name_cache[module_name] = handler
             return handler
 
     def _module_path(self, module_name: str) -> Path:
@@ -311,7 +347,7 @@ def create_rotating_file_handler(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if config.rotation == "daily":
-        handler: logging.Handler = TimedRotatingFileHandler(
+        handler: logging.Handler = _TrackedTimedRotatingFileHandler(
             filename=path,
             when="midnight",
             interval=1,
@@ -320,7 +356,7 @@ def create_rotating_file_handler(
             delay=delay,
         )
     else:
-        handler = RotatingFileHandler(
+        handler = _TrackedRotatingFileHandler(
             filename=path,
             maxBytes=parse_size_limit(config.size_limit),
             backupCount=config.retention,

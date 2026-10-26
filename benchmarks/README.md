@@ -1,6 +1,6 @@
 # Benchmarks
 
-A stdlib-only benchmark suite comparing `LogConfig(use_queue=False)` and `LogConfig(use_queue=True)` across three output profiles: null console (`stdout` redirected to `/dev/null`), rotating local file, and dual null+file sinks. It also supports `cProfile`.
+A stdlib-only benchmark suite comparing `LogConfig(use_queue=False)` and `LogConfig(use_queue=True)` across five output profiles: null console (`stdout` redirected to `/dev/null`), rotating aggregate file, dual null+file, module-file-only, and triple null+module+aggregate sinks. It also supports `cProfile`.
 
 ```bash
 PYTHONPATH=. python benchmarks/logging_benchmark.py --count 10000 --repeats 5

@@ -28,14 +28,15 @@ from cells.log.manager import LogManager
 
 
 def run_once(count: int, *, queued: bool, sink: str) -> dict[str, float | int | bool]:
-    """Measure producer/drain time with discard, local file or dual sinks."""
+    """Measure producer/drain time across console, aggregate and module sinks."""
     with tempfile.TemporaryDirectory(prefix="cells-bench-") as directory:
         manager = LogManager()
         config = LogConfig(
             app_name="bench",
-            enable_console=(sink in {"null", "dual"}),
+            enable_console=(sink in {"null", "dual", "triple"}),
             console_to_stderr=False,
-            enable_total_file=(sink in {"file", "dual"}),
+            enable_total_file=(sink in {"file", "dual", "triple"}),
+            enable_module_file=(sink in {"module", "triple"}),
             log_dir=Path(directory),
             use_queue=queued,
             queue_capacity=count * 2,
@@ -74,7 +75,7 @@ def main() -> None:
     results = []
     with open(os.devnull, "w", encoding="utf-8") as null:
         with redirect_stdout(null):
-            for sink in ("null", "file", "dual"):
+            for sink in ("null", "file", "dual", "module", "triple"):
                 for queued in (False, True):
                     for _ in range(1 if args.profile else args.repeats):
                         if args.profile:
@@ -92,7 +93,7 @@ def main() -> None:
                                 file=sys.stderr,
                             )
                         results.append(result)
-    for sink in ("null", "file", "dual"):
+    for sink in ("null", "file", "dual", "module", "triple"):
         for queued in (False, True):
             rows = [r for r in results if r["sink"] == sink and r["queued"] == queued]
             print(
